@@ -1,4 +1,4 @@
-#include "hex.h"
+#include "hex.hh"
 
 std::string hex(const void *ptr, size_t size) {
   std::string result;
