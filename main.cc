@@ -4,6 +4,7 @@
 // connected, snoop on DNS requests by IoT devices, check NAT masquerades,
 // forward ports, etc.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -11,7 +12,11 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <optional>
+#include <queue>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -27,6 +32,7 @@
 #include <unistd.h>
 
 #include "epoll.hh"
+#include "format.hh"
 #include "hex.hh"
 #include "log.hh"
 #include "net_types.hh"
@@ -76,66 +82,7 @@ void SetNonBlocking(int fd, string &error) {
   }
 }
 
-map<IP, vector<string>> ReadEtcHosts() {
-  map<IP, vector<string>> etc_hosts;
-  std::ifstream hosts_stream("/etc/hosts");
-  std::string line;
-  while (std::getline(hosts_stream, line)) {
-    if (auto pos = line.find("#"); pos != string::npos) {
-      line.resize(pos);
-    }
-    std::istringstream iss(line);
-    std::string ip_str;
-    if (!(iss >> ip_str)) {
-      continue;
-    }
-    IP ip;
-    if (!ip.TryParse(ip_str.c_str())) {
-      continue;
-    }
-    std::string hostname;
-    while (iss >> hostname) {
-      etc_hosts[ip].push_back(hostname);
-    }
-  }
-  return etc_hosts;
-}
-
-map<MAC, IP> ReadEtcEthers(const map<IP, vector<string>> &etc_hosts) {
-  map<MAC, IP> etc_ethers;
-  std::ifstream ethers_stream("/etc/ethers");
-  std::string line;
-  while (std::getline(ethers_stream, line)) {
-    if (auto pos = line.find("#"); pos != string::npos) {
-      line.resize(pos);
-    }
-    std::istringstream iss(line);
-    std::string mac_str;
-    std::string addr_str;
-    if (!(iss >> mac_str >> addr_str)) {
-      continue;
-    }
-    MAC mac;
-    if (!mac.TryParse(mac_str.c_str())) {
-      continue;
-    }
-    IP ip;
-    if (ip.TryParse(addr_str.c_str())) {
-      etc_ethers[mac] = ip;
-    } else {
-      for (auto it : etc_hosts) {
-        for (auto hostname : it.second) {
-          if (hostname == addr_str) {
-            etc_ethers[mac] = it.first;
-            goto outer;
-          }
-        }
-      }
-    outer:
-    }
-  }
-  return etc_ethers;
-}
+template <typename Iter> Iter next(Iter iter) { return ++iter; }
 
 using chrono::steady_clock;
 
@@ -203,6 +150,80 @@ void Set(IP ip, MAC mac, int af_inet_fd, string &error) {
 }
 
 } // namespace arp
+
+namespace etc {
+
+map<IP, vector<string>> ReadHosts() {
+  map<IP, vector<string>> etc_hosts;
+  std::ifstream hosts_stream("/etc/hosts");
+  std::string line;
+  while (std::getline(hosts_stream, line)) {
+    if (auto pos = line.find("#"); pos != string::npos) {
+      line.resize(pos);
+    }
+    std::istringstream iss(line);
+    std::string ip_str;
+    if (!(iss >> ip_str)) {
+      continue;
+    }
+    IP ip;
+    if (!ip.TryParse(ip_str.c_str())) {
+      continue;
+    }
+    std::string hostname;
+    while (iss >> hostname) {
+      etc_hosts[ip].push_back(hostname);
+    }
+  }
+  return etc_hosts;
+}
+
+map<MAC, IP> ReadEthers(const map<IP, vector<string>> &etc_hosts) {
+  map<MAC, IP> etc_ethers;
+  std::ifstream ethers_stream("/etc/ethers");
+  std::string line;
+  while (std::getline(ethers_stream, line)) {
+    if (auto pos = line.find("#"); pos != string::npos) {
+      line.resize(pos);
+    }
+    std::istringstream iss(line);
+    std::string mac_str;
+    std::string addr_str;
+    if (!(iss >> mac_str >> addr_str)) {
+      continue;
+    }
+    MAC mac;
+    if (!mac.TryParse(mac_str.c_str())) {
+      continue;
+    }
+    IP ip;
+    if (ip.TryParse(addr_str.c_str())) {
+      etc_ethers[mac] = ip;
+    } else {
+      for (auto it : etc_hosts) {
+        for (auto hostname : it.second) {
+          if (hostname == addr_str) {
+            etc_ethers[mac] = it.first;
+            goto outer;
+          }
+        }
+      }
+    outer:
+    }
+  }
+  return etc_ethers;
+}
+
+map<IP, vector<string>> hosts;
+map<MAC, IP> ethers;
+
+// Read files from /etc/ and populate etc::hosts & etc::ethers.
+void ReadConfig() {
+  hosts = ReadHosts();
+  ethers = ReadEthers(hosts);
+}
+
+} // namespace etc
 
 namespace dhcp {
 
@@ -542,13 +563,14 @@ struct __attribute__((__packed__)) DomainName : Base {
     int n = domain_name.size();
     void *buffer = malloc(sizeof(DomainName) + n);
     auto r = unique_ptr<DomainName>(new (buffer) DomainName(n));
-    memcpy((void*)r->value, domain_name.data(), n);
+    memcpy((void *)r->value, domain_name.data(), n);
     return r;
   }
-  string domain_name() const { return std::string((const char *)value, length); }
-  string to_string() const {
-    return "DomainName(" + domain_name() + ")";
+  string domain_name() const {
+    return std::string((const char *)value, length);
   }
+  string to_string() const { return "DomainName(" + domain_name() + ")"; }
+
 private:
   DomainName(int length) : Base(kCode, length) {}
 };
@@ -864,16 +886,13 @@ struct Server : epoll::Listener {
 
   map<IP, Entry> entries;
 
-  void ReadEtcConfig() {
-    map<IP, vector<string>> etc_hosts = ReadEtcHosts();
-    map<MAC, IP> etc_ethers = ReadEtcEthers(etc_hosts);
-
-    for (auto [mac, ip] : etc_ethers) {
+  void Init() {
+    for (auto [mac, ip] : etc::ethers) {
       auto &entry = entries[ip];
       entry.client_id = mac.to_string();
       entry.expiration = steady_clock::time_point::max(); // never expire
-      if (auto etc_hosts_it = etc_hosts.find(ip);
-          etc_hosts_it != etc_hosts.end()) {
+      if (auto etc_hosts_it = etc::hosts.find(ip);
+          etc_hosts_it != etc::hosts.end()) {
         auto &aliases = etc_hosts_it->second;
         if (!aliases.empty()) {
           entry.hostname = aliases[0];
@@ -1047,7 +1066,6 @@ struct Server : epoll::Listener {
     len = recvfrom(fd, recvbuf, sizeof(recvbuf), 0,
                    (struct sockaddr *)&clientaddr, &clilen);
     IP source_ip(clientaddr.sin_addr.s_addr);
-    LOG << "Received a message from " << source_ip.to_string();
     if (len < sizeof(PacketView)) {
       ERROR << "DHCP server received a packet that is too short: " << len
             << " bytes:\n"
@@ -1182,7 +1200,796 @@ Server server;
 
 namespace dns {
 
-void StartServer() {}
+static constexpr uint16_t kServerPort = 53;
+
+#define BIG_ENDIAN_16(x) ((x >> 8) | (x << 8))
+
+enum class Type : uint16_t {
+  A = BIG_ENDIAN_16(1),
+  NS = BIG_ENDIAN_16(2),
+  CNAME = BIG_ENDIAN_16(5),
+  SOA = BIG_ENDIAN_16(6),
+  PTR = BIG_ENDIAN_16(12),
+  MX = BIG_ENDIAN_16(15),
+  TXT = BIG_ENDIAN_16(16),
+  AAAA = BIG_ENDIAN_16(28),
+  SRV = BIG_ENDIAN_16(33),
+  ANY = BIG_ENDIAN_16(255),
+};
+
+const char *TypeToString(Type t) {
+  switch (t) {
+  case Type::A:
+    return "A";
+  case Type::NS:
+    return "NS";
+  case Type::CNAME:
+    return "CNAME";
+  case Type::SOA:
+    return "SOA";
+  case Type::PTR:
+    return "PTR";
+  case Type::MX:
+    return "MX";
+  case Type::TXT:
+    return "TXT";
+  case Type::AAAA:
+    return "AAAA";
+  case Type::SRV:
+    return "SRV";
+  case Type::ANY:
+    return "ANY";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+enum class Class : uint16_t {
+  IN = BIG_ENDIAN_16(1),
+  ANY = BIG_ENDIAN_16(255),
+};
+
+const char *ClassToString(Class c) {
+  switch (c) {
+  case Class::IN:
+    return "IN";
+  case Class::ANY:
+    return "ANY";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+pair<string, size_t> LoadDomainName(const uint8_t *dns_message_base,
+                                    size_t dns_message_len, size_t offset) {
+  size_t start_offset = offset;
+  string domain_name;
+  while (true) {
+    if (offset >= dns_message_len) {
+      return make_pair("", 0);
+    }
+    uint8_t n = dns_message_base[offset++];
+    if (n == 0) {
+      return make_pair(domain_name, offset - start_offset);
+    }
+    if ((n & 0b1100'0000) == 0b1100'0000) { // DNS compression
+      if (offset >= dns_message_len) {
+        return make_pair("", 0);
+      }
+      uint16_t new_offset =
+          ((n & 0b0011'1111) << 8) | dns_message_base[offset++];
+      if (new_offset >=
+          start_offset) { // disallow forward jumps to avoid infinite loops
+        return make_pair("", 0);
+      }
+      auto [suffix, suffix_bytes] =
+          LoadDomainName(dns_message_base, dns_message_len, new_offset);
+      if (suffix_bytes == 0) {
+        return make_pair("", 0);
+      }
+      if (!domain_name.empty()) {
+        domain_name += '.';
+      }
+      domain_name += suffix;
+      return make_pair(domain_name, offset - start_offset);
+    }
+    if (offset + n > dns_message_len) {
+      return make_pair("", 0);
+    }
+    if (!domain_name.empty()) {
+      domain_name += '.';
+    }
+    domain_name.append((char *)dns_message_base + offset, n);
+    offset += n;
+  }
+}
+
+string EncodeDomainName(const string &domain_name) {
+  string buffer;
+  size_t seg_begin = 0;
+encode_segment:
+  size_t seg_end = domain_name.find('.', seg_begin);
+  if (seg_end == -1)
+    seg_end = domain_name.size();
+  size_t n = seg_end - seg_begin;
+  if (n) { // don't encode 0-length segments - because \0 marks the end of
+           // domain name
+    buffer.append({(char)n});
+    buffer.append(domain_name, seg_begin, n);
+  }
+  if (seg_end < domain_name.size()) {
+    seg_begin = seg_end + 1;
+    goto encode_segment;
+  }
+  buffer.append({0});
+  return buffer;
+}
+
+struct Question {
+  string domain_name = "";
+  Type type = Type::A;
+  Class class_ = Class::IN;
+  size_t LoadFrom(const uint8_t *ptr, size_t len, size_t offset) {
+    size_t start_offset = offset;
+    auto [loaded_name, loaded_size] = LoadDomainName(ptr, len, offset);
+    if (loaded_size == 0) {
+      return 0;
+    }
+    domain_name = loaded_name;
+    offset += loaded_size;
+    if (offset + 4 > len) {
+      return 0;
+    }
+    type = *(Type *)(ptr + offset);
+    offset += 2;
+    class_ = *(Class *)(ptr + offset);
+    offset += 2;
+    return offset - start_offset;
+  }
+  void write_to(string &buffer) const {
+    string encoded = EncodeDomainName(domain_name);
+    buffer.append(encoded);
+    buffer.append((char *)&type, sizeof(type));
+    buffer.append((char *)&class_, sizeof(class_));
+  }
+  string to_string() const {
+    return "dns::Question(" + domain_name +
+           ", type=" + string(TypeToString(type)) +
+           ", class=" + string(ClassToString(class_)) + ")";
+  }
+  bool operator==(const Question &other) const {
+    return (domain_name == other.domain_name) && (type == other.type) &&
+           (class_ == other.class_);
+  }
+};
+
+struct Record : Question {
+  uint32_t ttl;
+  uint16_t data_length;
+  string data;
+  size_t LoadFrom(const uint8_t *ptr, size_t len, size_t offset) {
+    size_t start_offset = offset;
+    size_t base_size = Question::LoadFrom(ptr, len, offset);
+    if (base_size == 0) {
+      return 0;
+    }
+    offset += base_size;
+    if (offset + 6 > len) {
+      return 0;
+    }
+    ttl = ntohl(*(uint32_t *)(ptr + offset));
+    offset += 4;
+    data_length = ntohs(*(uint16_t *)(ptr + offset));
+    offset += 2;
+    if (offset + data_length > len) {
+      return 0;
+    }
+    if (type == Type::CNAME) {
+      size_t limited_len = offset + data_length;
+      auto [loaded_name, loaded_size] =
+          LoadDomainName(ptr, limited_len, offset);
+      if (loaded_size == 0) {
+        return 0;
+      }
+      if (loaded_size != data_length) {
+        return 0;
+      }
+      offset += data_length;
+      // Re-encode domain name but without DNS compression
+      data = EncodeDomainName(loaded_name);
+      data_length = data.size();
+    } else {
+      data = string((const char *)(ptr + offset), data_length);
+      offset += data_length;
+    }
+    return offset - start_offset;
+  }
+  void write_to(string &buffer) const {
+    Question::write_to(buffer);
+    uint32_t ttl_big_endian = htonl(ttl);
+    buffer.append((char *)&ttl_big_endian, sizeof(ttl_big_endian));
+    uint16_t data_length_big_endian = htons(data_length);
+    buffer.append((char *)&data_length_big_endian,
+                  sizeof(data_length_big_endian));
+    buffer.append(data);
+  }
+  string to_string() const {
+    return "dns::Record(" + Question::to_string() +
+           ", ttl=" + std::to_string(ttl) + ", data=\"" +
+           hex(data.data(), data.size()) + "\")";
+  }
+};
+
+struct __attribute__((__packed__)) Header {
+  enum OperationCode {
+    QUERY = 0,
+    IQUERY = 1,
+    STATUS = 2,
+    NOTIFY = 4,
+    UPDATE = 5,
+  };
+  static const char *OperationCodeToString(OperationCode code) {
+    switch (code) {
+    case QUERY:
+      return "QUERY";
+    case IQUERY:
+      return "IQUERY";
+    case STATUS:
+      return "STATUS";
+    case NOTIFY:
+      return "NOTIFY";
+    case UPDATE:
+      return "UPDATE";
+    default:
+      return "UNKNOWN";
+    }
+  }
+  enum ResponseCode {
+    NO_ERROR = 0,
+    FORMAT_ERROR = 1,
+    SERVER_FAILURE = 2,
+    NAME_ERROR = 3,
+    NOT_IMPLEMENTED = 4,
+    REFUSED = 5,
+  };
+  static const char *ResponseCodeToString(ResponseCode code) {
+    switch (code) {
+    case NO_ERROR:
+      return "NO_ERROR";
+    case FORMAT_ERROR:
+      return "FORMAT_ERROR";
+    case SERVER_FAILURE:
+      return "SERVER_FAILURE";
+    case NAME_ERROR:
+      return "NAME_ERROR";
+    case NOT_IMPLEMENTED:
+      return "NOT_IMPLEMENTED";
+    case REFUSED:
+      return "REFUSED";
+    default:
+      return "UNKNOWN";
+    }
+  }
+  uint16_t id; // big endian
+
+  // order swapped to match the order in the packet
+  bool recursion_desired : 1;
+  bool truncated : 1;
+  bool authoritative : 1;
+  OperationCode opcode : 4;
+  bool reply : 1;
+
+  ResponseCode response_code : 4;
+  uint8_t reserved : 3;
+  bool recursion_available : 1;
+
+  uint16_t question_count;   // big endian
+  uint16_t answer_count;     // big endian
+  uint16_t authority_count;  // big endian
+  uint16_t additional_count; // big endian
+  void write_to(string &buffer) {
+    buffer.append((const char *)this, sizeof(*this));
+  }
+  string to_string() const {
+    string r = "dns::Header {\n";
+    r += "  id: " + f("0x%04hx", ntohs(id)) + "\n";
+    r += "  reply: " + std::to_string(reply) + "\n";
+    r += "  opcode: " + string(OperationCodeToString(opcode)) + "\n";
+    r += "  authoritative: " + std::to_string(authoritative) + "\n";
+    r += "  truncated: " + std::to_string(truncated) + "\n";
+    r += "  recursion_desired: " + std::to_string(recursion_desired) + "\n";
+    r += "  recursion_available: " + std::to_string(recursion_available) + "\n";
+    r += "  response_code: " + string(ResponseCodeToString(response_code)) +
+         "\n";
+    r += "  question_count: " + std::to_string(ntohs(question_count)) + "\n";
+    r += "  answer_count: " + std::to_string(ntohs(answer_count)) + "\n";
+    r += "  authority_count: " + std::to_string(ntohs(authority_count)) + "\n";
+    r +=
+        "  additional_count: " + std::to_string(ntohs(additional_count)) + "\n";
+    r += "}";
+    return r;
+  }
+};
+
+static_assert(sizeof(Header) == 12, "dns::Header is not packed correctly");
+
+struct Message {
+  Header header;
+  Question question;
+  vector<Record> answers;
+
+  void Parse(uint8_t *ptr, size_t len, string &err) {
+    if (len < sizeof(Header)) {
+      err = "DNS message buffer is too short: " + std::to_string(len) +
+            " bytes. DNS header requires at least 12 bytes. Hex-escaped "
+            "buffer: " +
+            hex(ptr, len);
+      return;
+    }
+    header = *(Header *)ptr;
+
+    if (ntohs(header.question_count) != 1) {
+      err =
+          "DNS message contains more than one question. This is not supported.";
+      return;
+    }
+
+    size_t offset = sizeof(Header);
+    if (auto q_size = question.LoadFrom(ptr, len, offset)) {
+      offset += q_size;
+    } else {
+      err = "Failed to load DNS question from " + hex(ptr, len);
+      return;
+    }
+
+    for (int i = 0; i < ntohs(header.answer_count); ++i) {
+      Record &r = answers.emplace_back();
+      if (auto r_size = r.LoadFrom(ptr, len, offset)) {
+        offset += r_size;
+      } else {
+        err = "Failed to load answer #" + std::to_string(i) +
+              " from DNS query. Full query:\n" + hex(ptr, len);
+        return;
+      }
+    }
+  }
+
+  string to_string() const {
+    string r = "dns::Message {\n";
+    r += IndentString(header.to_string()) + "\n";
+    r += "  " + question.to_string() + "\n";
+    for (const Record &a : answers) {
+      r += "  " + a.to_string() + "\n";
+    }
+    r += "}";
+    return r;
+  }
+};
+
+struct IncomingRequest {
+  Header header;
+  IP client_ip;
+  uint16_t client_port;
+};
+
+struct Entry;
+void AnswerRequest(const IncomingRequest &request, const Entry &e, string &err);
+
+struct Entry {
+  mutable optional<uint16_t> outgoing_id;
+
+  mutable Header::ResponseCode response_code;
+  Question question;
+  mutable vector<Record> answers;
+  mutable steady_clock::time_point expiration;
+  mutable vector<IncomingRequest> incoming_requests;
+
+  Entry(Header::ResponseCode response_code, const Question &question,
+        const vector<Record> &answers)
+      : outgoing_id(), response_code(response_code), question(question),
+        answers(answers) {
+    steady_clock::duration shortest_ttl =
+        response_code == Header::NAME_ERROR ? 60s : 24h;
+    for (auto &answer : answers) {
+      steady_clock::duration ttl = chrono::seconds(answer.ttl);
+      if (ttl < shortest_ttl) {
+        shortest_ttl = ttl;
+      }
+    }
+    expiration = steady_clock::now() + shortest_ttl;
+  }
+  Entry(uint16_t outgoing_id, const Question &question)
+      : outgoing_id(outgoing_id), response_code(Header::NO_ERROR),
+        question(question), answers() {
+    expiration = steady_clock::now() + 10s;
+  }
+  bool IsValid() const { return !answers.empty() || !outgoing_id.has_value(); }
+  void HandleIncomingRequest(const IncomingRequest &request) const {
+    if (IsValid()) {
+      LOG << "Answering request from cache: " << question.to_string();
+      string err;
+      AnswerRequest(request, *this, err);
+      if (!err.empty()) {
+        ERROR << err;
+      }
+    } else {
+      incoming_requests.push_back(request);
+      LOG << "Adding incoming request to waitlist: " << question.to_string()
+          << ". Currently " << incoming_requests.size()
+          << " requests are waiting.";
+    }
+  }
+  bool operator==(const Question &other) const { return question == other; }
+};
+
+struct QuestionHash {
+  using is_transparent = std::true_type;
+
+  size_t operator()(const Question &q) const {
+    return hash<string>()(q.domain_name) ^ hash<Type>()(q.type) ^
+           hash<Class>()(q.class_);
+  }
+  size_t operator()(const Entry &e) const { return (*this)(e.question); }
+  size_t operator()(const Entry *e) const { return (*this)(*e); }
+};
+
+struct QuestionEqual {
+  using is_transparent = std::true_type;
+
+  bool operator()(const Entry &a, const Entry &b) const {
+    return a.question == b.question;
+  }
+  bool operator()(Entry *a, Entry *b) const {
+    return a->question == b->question;
+  }
+  bool operator()(const Question &a, const Entry &b) const {
+    return a == b.question;
+  }
+  bool operator()(const Question &a, Entry *b) const {
+    return a == b->question;
+  }
+};
+
+// TODO: deduplicate incoming requests with the same IP, port & id
+// TODO: working expiration queue
+// TODO: read /etc/resolv.conf in etc::ReadConfig instead of res_init in main
+// TODO: merge all "SendTo" functions into one
+unordered_set<Entry *, QuestionHash, QuestionEqual> cache;
+
+unordered_set<Entry, QuestionHash, QuestionEqual> static_cache;
+
+priority_queue<unique_ptr<Entry>> expiration_queue;
+
+const Entry *GetCachedEntry(const Question &question) {
+  if (question.domain_name.ends_with("." + kDomainName)) {
+    auto it = static_cache.find(question);
+    if (it != static_cache.end()) {
+      it->expiration = steady_clock::now() + 1h;
+      return &*it;
+    }
+    static Entry name_not_found_entry(Header::NAME_ERROR, question, {});
+    name_not_found_entry.expiration = steady_clock::now() + 60s;
+    return &name_not_found_entry;
+  } else {
+    auto it = cache.find(question);
+    if (it == cache.end()) {
+      return nullptr;
+    }
+    return *it;
+  }
+}
+
+struct Client : epoll::Listener {
+  uint16_t request_id;
+
+  uint16_t GetNextRequestId() {
+    return request_id = htons(ntohs(request_id) + 1);
+  }
+
+  void Listen(string &error) {
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+      error = "socket";
+      return;
+    }
+
+    SetNonBlocking(fd, error);
+    if (!error.empty()) {
+      StopListening();
+      return;
+    }
+
+    epoll::Add(this, error);
+  }
+
+  // Stop listening.
+  void StopListening() {
+    string error_ignored;
+    epoll::Del(this, error_ignored);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+  }
+
+  void NotifyRead(std::string &abort_error) override {
+    uint8_t recvbuf[65536] = {0};
+    int len;
+    struct sockaddr_in clientaddr;
+    socklen_t clilen = sizeof(struct sockaddr);
+    len = recvfrom(fd, recvbuf, sizeof(recvbuf), 0,
+                   (struct sockaddr *)&clientaddr, &clilen);
+    IP source_ip(clientaddr.sin_addr.s_addr);
+    if (source_ip != dns_servers[0]) {
+      LOG << "DNS client received a packet from an unexpected source: "
+          << source_ip.to_string()
+          << " (expected: " << dns_servers[0].to_string() << ")";
+      return;
+    }
+    uint16_t source_port = ntohs(clientaddr.sin_port);
+    if (source_port != kServerPort) {
+      LOG << "DNS client received a packet from an unexpected source port: "
+          << source_port << " (expected port " << kServerPort << ")";
+      return;
+    }
+    Message msg;
+    string err;
+    msg.Parse(recvbuf, len, err);
+    if (!err.empty()) {
+      ERROR << err;
+      return;
+    }
+
+    if (msg.header.opcode != Header::QUERY) {
+      LOG << "DNS client received a packet with an unsupported opcode: "
+          << msg.header.opcode << ". Full query: " << msg.header.to_string();
+      return;
+    }
+
+    if (!msg.header.reply) {
+      LOG << "DNS client received a packet that is not a reply: "
+          << msg.header.to_string();
+      return;
+    }
+
+    const Entry *entry = GetCachedEntry(msg.question);
+    if (entry == nullptr) {
+      LOG << "DNS client received an unexpected / expired reply: "
+          << msg.question.to_string();
+      return;
+    }
+    if (entry->outgoing_id.has_value() &&
+        entry->outgoing_id.value() != msg.header.id) {
+      LOG << "DNS client received a reply with an wrong ID: "
+          << f("0x%04hx", msg.header.id)
+          << " (expected: " << f("0x%04hx", entry->outgoing_id.value()) << ")";
+      return;
+    }
+    entry->outgoing_id.reset();
+
+    LOG << "Received DNS reply from upstream server: "
+        << msg.question.to_string();
+
+    entry->response_code = msg.header.response_code;
+    entry->answers = msg.answers;
+
+    for (auto &inc_req : entry->incoming_requests) {
+      AnswerRequest(inc_req, *entry, err);
+      if (!err.empty()) {
+        ERROR << err;
+        err = "";
+      }
+    }
+    LOG << "Answered " << entry->incoming_requests.size()
+        << " incoming requests with this reply.";
+    entry->incoming_requests.clear();
+  }
+
+  void SendTo(const string &buffer, IP ip, uint16_t port, string &error) {
+    sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr = {.s_addr = ip.addr},
+    };
+    if (sendto(fd, buffer.data(), buffer.size(), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+      error = "sendto: " + string(strerror(errno));
+    }
+  }
+
+  const char *Name() const override { return "dns::Client"; }
+};
+
+Client client;
+
+const Entry &GetCachedEntryOrSendRequest(const Question &question,
+                                         string &err) {
+  const Entry *entry = GetCachedEntry(question);
+  if (entry == nullptr) {
+    // Send a request to the upstream DNS server.
+    uint16_t id = client.GetNextRequestId();
+    auto uniq = make_unique<Entry>(id, question);
+    entry = uniq.get();
+    cache.insert(uniq.get());
+    string buffer;
+    Header{.id = id, .recursion_desired = true, .question_count = htons(1)}
+        .write_to(buffer);
+    question.write_to(buffer);
+    client.SendTo(buffer, dns_servers[0], kServerPort, err);
+    if (err.empty()) {
+      LOG << "Sending a DNS request to upstream server: "
+          << question.to_string() << ". Currently " << cache.size()
+          << " cached entries.";
+    }
+    expiration_queue.emplace(std::move(uniq));
+  }
+  return *entry;
+}
+
+struct Server : epoll::Listener {
+
+  // Start listening.
+  //
+  // To actually accept new connections, make sure to Poll the `epoll`
+  // instance after listening.
+  void Listen(string &error) {
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1) {
+      error = "socket";
+      return;
+    }
+
+    SetNonBlocking(fd, error);
+    if (!error.empty()) {
+      StopListening();
+      return;
+    }
+
+    int flag = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(flag)) <
+        0) {
+      error = "setsockopt: SO_REUSEADDR";
+      StopListening();
+      return;
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, kInterfaceName.data(),
+                   kInterfaceName.size()) < 0) {
+      error = "Error when setsockopt bind to device";
+      StopListening();
+      return;
+    };
+
+    sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(kServerPort),
+        .sin_addr = {.s_addr = htonl(INADDR_ANY)},
+    };
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+      error = "bind: ";
+      error += strerror(errno);
+      StopListening();
+      return;
+    }
+
+    epoll::Add(this, error);
+  }
+
+  // Stop listening.
+  void StopListening() {
+    string error_ignored;
+    epoll::Del(this, error_ignored);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+  }
+
+  void SendTo(const string &buffer, IP ip, uint16_t port, string &error) {
+    sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr = {.s_addr = ip.addr},
+    };
+    if (sendto(fd, buffer.data(), buffer.size(), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+      error = "sendto: " + string(strerror(errno));
+    }
+  }
+
+  void NotifyRead(string &abort_error) override {
+    uint8_t recvbuf[65536] = {0};
+    int len;
+    struct sockaddr_in clientaddr;
+    socklen_t clilen = sizeof(struct sockaddr);
+    len = recvfrom(fd, recvbuf, sizeof(recvbuf), 0,
+                   (struct sockaddr *)&clientaddr, &clilen);
+    IP source_ip(clientaddr.sin_addr.s_addr);
+    if ((source_ip & netmask) != (server_ip & netmask)) {
+      LOG << "DNS server received a packet from an unexpected source: "
+          << source_ip.to_string() << " (expected network "
+          << (server_ip & netmask).to_string() << ")";
+      return;
+    }
+    uint16_t source_port = ntohs(clientaddr.sin_port);
+    Message msg;
+    string err;
+    msg.Parse(recvbuf, len, err);
+    if (!err.empty()) {
+      ERROR << err;
+      return;
+    }
+
+    if (msg.header.opcode != Header::QUERY) {
+      LOG << "DNS server received a packet with an unsupported opcode: "
+          << msg.header.opcode << ". Full query: " << msg.header.to_string();
+      return;
+    }
+
+    const Entry &entry = GetCachedEntryOrSendRequest(msg.question, err);
+    if (!err.empty()) {
+      ERROR << err;
+      return;
+    }
+    entry.HandleIncomingRequest(IncomingRequest{
+        .header = msg.header,
+        .client_ip = source_ip,
+        .client_port = source_port,
+    });
+  }
+
+  const char *Name() const override { return "dns::Server"; }
+};
+
+Server server;
+
+void AnswerRequest(const IncomingRequest &request, const Entry &e,
+                   string &err) {
+  string buffer;
+  Header response_header{
+      .id = request.header.id,
+      .recursion_desired = true,
+      .truncated = false,
+      .authoritative = false,
+      .opcode = Header::QUERY,
+      .reply = true,
+      .response_code = e.response_code,
+      .reserved = 0,
+      .recursion_available = true,
+      .question_count = htons(1),
+      .answer_count = htons(e.answers.size()),
+      .authority_count = 0,
+      .additional_count = 0,
+  };
+  response_header.write_to(buffer);
+  e.question.write_to(buffer);
+  for (auto &a : e.answers) {
+    a.write_to(buffer);
+  }
+  server.SendTo(buffer, request.client_ip, request.client_port, err);
+}
+
+void Start(string &err) {
+  client.request_id = random<uint16_t>();
+  for (auto &[ip, aliases] : etc::hosts) {
+    for (auto &alias : aliases) {
+      string domain = alias + "." + kDomainName;
+      string encoded_domain = EncodeDomainName(domain);
+      Entry entry(Header::NO_ERROR, Question{.domain_name = domain},
+                  {Record{.ttl = 0,
+                          .data_length = (uint16_t)encoded_domain.size(),
+                          .data = encoded_domain}});
+      static_cache.insert(entry);
+    }
+  }
+  client.Listen(err);
+  if (!err.empty()) {
+    err = "Failed to start DNS client: " + err;
+    return;
+  }
+  server.Listen(err);
+  if (!err.empty()) {
+    err = "Failed to start DNS server: " + err;
+    return;
+  }
+}
 
 } // namespace dns
 
@@ -1193,7 +2000,7 @@ void StartServer() {}
 } // namespace http
 
 int main(int argc, char *argv[]) {
-  std::string error;
+  string err;
 
   epoll::Init();
 
@@ -1207,18 +2014,24 @@ int main(int argc, char *argv[]) {
   server_ip = IP::FromInterface(kInterfaceName);
   netmask = IP::NetmaskFromInterface(kInterfaceName);
 
-  dhcp::server.ReadEtcConfig();
-  dhcp::server.Listen(error);
-  if (!error.empty()) {
-    FATAL << "Failed to start DHCP server: " << error;
+  etc::ReadConfig();
+
+  dhcp::server.Init();
+  dhcp::server.Listen(err);
+  if (!err.empty()) {
+    FATAL << "Failed to start DHCP server: " << err;
   }
 
-  dns::StartServer();
+  dns::Start(err);
+  if (!err.empty()) {
+    FATAL << err;
+  }
+
   http::StartServer();
   LOG << "Starting epoll::Loop()";
-  epoll::Loop(error);
-  if (!error.empty()) {
-    FATAL << error;
+  epoll::Loop(err);
+  if (!err.empty()) {
+    FATAL << err;
   }
   return 0;
 }
