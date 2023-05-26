@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -92,6 +93,12 @@ void SendTo(int fd, const string &buffer, IP ip, uint16_t port, string &error) {
     error = "sendto: " + string(strerror(errno));
   }
 }
+
+template <class... Ts> struct overloaded : Ts... {
+  using Ts::operator()...;
+};
+// explicit deduction guide (not needed as of C++20)
+template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 template <typename Iter> Iter next(Iter iter) { return ++iter; }
 
@@ -1615,58 +1622,77 @@ struct Entry;
 void AnswerRequest(const IncomingRequest &request, const Entry &e, string &err);
 
 struct Entry {
-  mutable optional<uint16_t> outgoing_id;
+  struct Ready {
+    Header::ResponseCode response_code;
+    vector<Record> answers;
+  };
+  struct Pending {
+    uint16_t outgoing_id;
+    vector<IncomingRequest> incoming_requests;
+  };
 
-  mutable Header::ResponseCode response_code;
   Question question;
-  mutable vector<Record> answers;
   mutable steady_clock::time_point expiration;
-  mutable vector<IncomingRequest> incoming_requests;
+  mutable variant<Ready, Pending> state;
 
   // Constructs Entry in its valid state.
-  Entry(Header::ResponseCode response_code, const Question &question,
-        const vector<Record> &answers, steady_clock::time_point expiration)
-      : outgoing_id(), response_code(response_code), question(question),
-        answers(answers), expiration(expiration) {}
-  // Constructs Entry in its in-progress state.
-  Entry(uint16_t outgoing_id, const Question &question)
-      : outgoing_id(outgoing_id), response_code(Header::NO_ERROR),
-        question(question), answers() {
-    expiration = steady_clock::now() + 10s;
-  }
-  bool AnswerAvailable() const {
-    return !answers.empty() || !outgoing_id.has_value();
+  static Entry MakeReady(const Question &question,
+                         Header::ResponseCode response_code,
+                         const vector<Record> &answers) {
+    return Entry{
+        .question = question,
+        .expiration = steady_clock::time_point::max(),
+        .state = Ready{response_code, answers},
+    };
   }
   void HandleIncomingRequest(const IncomingRequest &request) const {
-    if (AnswerAvailable()) {
-      LOG << "Answering request from cache: " << question.to_string();
-      string err;
-      AnswerRequest(request, *this, err);
-      if (!err.empty()) {
-        ERROR << err;
-      }
-    } else {
-      for (auto &r : incoming_requests) {
-        if (r.client_ip == request.client_ip &&
-            r.client_port == request.client_port &&
-            r.header.id == request.header.id) {
-          LOG << "Ignoring duplicate request from "
-              << request.client_ip.to_string() << ":" << request.client_port
-              << ": " << question.to_string();
-          return;
-        }
-      }
-      UpdateExpiration(steady_clock::now() + 10s);
-      incoming_requests.push_back(request);
-      LOG << "Adding incoming request to waitlist: " << question.to_string()
-          << ". Currently " << incoming_requests.size()
-          << " requests are waiting.";
-    }
+    visit(overloaded{
+              [&](Ready &r) {
+                LOG << "Answering request from cache: " << question.to_string();
+                string err;
+                AnswerRequest(request, *this, err);
+                if (!err.empty()) {
+                  ERROR << err;
+                }
+              },
+              [&](Pending &p) {
+                for (auto &r : p.incoming_requests) {
+                  if (r.client_ip == request.client_ip &&
+                      r.client_port == request.client_port &&
+                      r.header.id == request.header.id) {
+                    LOG << "Ignoring duplicate request from "
+                        << request.client_ip.to_string() << ":"
+                        << request.client_port << ": " << question.to_string();
+                    return;
+                  }
+                }
+                UpdateExpiration(steady_clock::now() + 10s);
+                p.incoming_requests.push_back(request);
+                LOG << "Adding incoming request to waitlist: "
+                    << question.to_string() << ". Currently "
+                    << p.incoming_requests.size() << " requests are waiting.";
+              },
+          },
+          state);
   }
   void HandleAnswer(const Message &msg, string &err) const {
-    outgoing_id.reset();
-    response_code = msg.header.response_code;
-    answers = msg.answers;
+    auto *pending = get_if<Pending>(&state);
+    if (pending == nullptr) {
+      err = "Received an answer for a ready entry: " + question.to_string();
+      return;
+    }
+
+    if (pending->outgoing_id != msg.header.id) {
+      err = "Received an answer with an wrong ID: " +
+            f("0x%04hx", msg.header.id) +
+            " (expected: " + f("0x%04hx", pending->outgoing_id) + ")";
+      return;
+    }
+
+    vector<IncomingRequest> incoming_requests =
+        std::move(pending->incoming_requests);
+    state.emplace<Ready>(
+        Ready{msg.header.response_code, std::move(msg.answers)});
 
     steady_clock::time_point new_expiration =
         steady_clock::now() +
@@ -1689,7 +1715,6 @@ struct Entry {
         break;
       }
     }
-    incoming_requests.clear();
   }
   void UpdateExpiration(steady_clock::time_point new_expiration) const;
   bool operator==(const Question &other) const { return question == other; }
@@ -1723,7 +1748,6 @@ struct QuestionEqual {
   }
 };
 
-// TODO: use std::variant to distinguish outgoing requests & cached entries
 // TODO: unify logging style:
 // For incoming requests:
 //   <id> <ip>:<port> Asks for <question>
@@ -1768,8 +1792,9 @@ const Entry *GetCachedEntry(const Question &question) {
       it->expiration = steady_clock::now() + 1h;
       return &*it;
     }
-    static Entry name_not_found_entry(Header::NAME_ERROR, question, {},
-                                      steady_clock::time_point::min());
+    static Entry name_not_found_entry =
+        Entry{.state = Entry::Ready{Header::NAME_ERROR, {}}};
+    name_not_found_entry.question = question;
     name_not_found_entry.expiration = steady_clock::now() + 60s;
     return &name_not_found_entry;
   } else {
@@ -1867,15 +1892,11 @@ struct Client : epoll::Listener {
           << msg.question.to_string();
       return;
     }
-    if (entry->outgoing_id.has_value() &&
-        entry->outgoing_id.value() != msg.header.id) {
-      LOG << "DNS client received a reply with an wrong ID: "
-          << f("0x%04hx", msg.header.id)
-          << " (expected: " << f("0x%04hx", entry->outgoing_id.value()) << ")";
+    entry->HandleAnswer(msg, err);
+    if (!err.empty()) {
+      ERROR << err;
       return;
     }
-
-    entry->HandleAnswer(msg, err);
   }
 
   const Entry &GetCachedEntryOrSendRequest(const Question &question,
@@ -1884,7 +1905,11 @@ struct Client : epoll::Listener {
     if (entry == nullptr) {
       // Send a request to the upstream DNS server.
       uint16_t id = AllocateRequestId();
-      Entry *new_entry = new Entry(id, question);
+      Entry *new_entry = new Entry{
+          .question = question,
+          .expiration = steady_clock::now() + 10s,
+          .state = Entry::Pending{id, {}},
+      };
       new_entry->UpdateExpiration(steady_clock::now() + 10s);
       entry = new_entry;
       cache.insert(entry);
@@ -2024,6 +2049,11 @@ Server server;
 
 void AnswerRequest(const IncomingRequest &request, const Entry &e,
                    string &err) {
+  const Entry::Ready *r = get_if<Entry::Ready>(&e.state);
+  if (r == nullptr) {
+    err = "AnswerRequest called on an entry that is not ready";
+    return;
+  }
   string buffer;
   Header response_header{
       .id = request.header.id,
@@ -2032,17 +2062,17 @@ void AnswerRequest(const IncomingRequest &request, const Entry &e,
       .authoritative = false,
       .opcode = Header::QUERY,
       .reply = true,
-      .response_code = e.response_code,
+      .response_code = r->response_code,
       .reserved = 0,
       .recursion_available = true,
       .question_count = htons(1),
-      .answer_count = htons(e.answers.size()),
+      .answer_count = htons(r->answers.size()),
       .authority_count = 0,
       .additional_count = 0,
   };
   response_header.write_to(buffer);
   e.question.write_to(buffer);
-  for (auto &a : e.answers) {
+  for (auto &a : r->answers) {
     a.write_to(buffer);
   }
   server.SendTo(buffer, request.client_ip, request.client_port, err);
@@ -2054,12 +2084,14 @@ void Start(string &err) {
     for (auto &alias : aliases) {
       string domain = alias + "." + kDomainName;
       string encoded_domain = EncodeDomainName(domain);
-      Entry entry(Header::NO_ERROR, Question{.domain_name = domain},
-                  {Record{.expiration = steady_clock::time_point::min(),
-                          .data_length = (uint16_t)encoded_domain.size(),
-                          .data = encoded_domain}},
-                  steady_clock::time_point::min());
-      static_cache.insert(entry);
+      static_cache.insert(Entry{
+          .question = Question{.domain_name = domain},
+          .expiration = steady_clock::time_point::max(),
+          .state = Entry::Ready{
+              .response_code = Header::NO_ERROR,
+              .answers = {Record{.expiration = steady_clock::time_point::max(),
+                                 .data_length = (uint16_t)encoded_domain.size(),
+                                 .data = encoded_domain}}}});
     }
   }
   client.Listen(err);
