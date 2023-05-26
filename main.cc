@@ -1613,6 +1613,14 @@ struct Entry {
         ERROR << err;
       }
     } else {
+      for (auto &r : incoming_requests) {
+        if (r.client_ip == request.client_ip &&
+            r.client_port == request.client_port && r.header.id == request.header.id) {
+          LOG << "Ignoring duplicate request from " << request.client_ip.to_string()
+              << ":" << request.client_port << ": " << question.to_string();
+          return;
+        }
+      }
       incoming_requests.push_back(request);
       LOG << "Adding incoming request to waitlist: " << question.to_string()
           << ". Currently " << incoming_requests.size()
@@ -1650,7 +1658,6 @@ struct QuestionEqual {
   }
 };
 
-// TODO: deduplicate incoming requests with the same IP, port & id
 // TODO: working expiration queue
 // TODO: read /etc/resolv.conf in etc::ReadConfig instead of res_init in main
 // TODO: merge all "SendTo" functions into one
@@ -1923,6 +1930,8 @@ struct Server : epoll::Listener {
       return;
     }
 
+    LOG << "Request " << f("0x%04hx", msg.header.id) << " for " << msg.question.to_string();
+    LOG_Indent();
     const Entry &entry = GetCachedEntryOrSendRequest(msg.question, err);
     if (!err.empty()) {
       ERROR << err;
@@ -1933,6 +1942,7 @@ struct Server : epoll::Listener {
         .client_ip = source_ip,
         .client_port = source_port,
     });
+    LOG_Unindent();
   }
 
   const char *Name() const override { return "dns::Server"; }
