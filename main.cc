@@ -51,7 +51,6 @@ const string kDomainName = "local";
 // variables.
 IP server_ip = {192, 168, 1, 1};
 IP netmask = {255, 255, 255, 0};
-vector<IP> dns_servers = {IP{8, 8, 8, 8}, IP{8, 8, 4, 4}};
 
 // Prefix each line with `spaces` spaces.
 std::string IndentString(std::string in, int spaces = 2) {
@@ -180,15 +179,15 @@ map<IP, vector<string>> ReadHosts() {
 
 map<MAC, IP> ReadEthers(const map<IP, vector<string>> &etc_hosts) {
   map<MAC, IP> etc_ethers;
-  std::ifstream ethers_stream("/etc/ethers");
-  std::string line;
-  while (std::getline(ethers_stream, line)) {
+  ifstream ethers_stream("/etc/ethers");
+  string line;
+  while (getline(ethers_stream, line)) {
     if (auto pos = line.find("#"); pos != string::npos) {
       line.resize(pos);
     }
-    std::istringstream iss(line);
-    std::string mac_str;
-    std::string addr_str;
+    istringstream iss(line);
+    string mac_str;
+    string addr_str;
     if (!(iss >> mac_str >> addr_str)) {
       continue;
     }
@@ -214,13 +213,41 @@ map<MAC, IP> ReadEthers(const map<IP, vector<string>> &etc_hosts) {
   return etc_ethers;
 }
 
+vector<IP> ReadResolv() {
+  vector<IP> resolv;
+  ifstream resolv_stream("/etc/resolv.conf");
+  string line;
+  while (getline(resolv_stream, line)) {
+    if (auto pos = line.find("#"); pos != string::npos) {
+      line.resize(pos);
+    }
+    istringstream iss(line);
+    string keyword;
+    if (!(iss >> keyword)) {
+      continue;
+    }
+    if (keyword == "nameserver") {
+      string ip_str;
+      if (iss >> ip_str) {
+        IP ip;
+        if (ip.TryParse(ip_str.c_str())) {
+          resolv.push_back(ip);
+        }
+      }
+    }
+  }
+  return resolv;
+}
+
 map<IP, vector<string>> hosts;
 map<MAC, IP> ethers;
+vector<IP> resolv = {IP(8, 8, 8, 8), IP(8, 8, 4, 4)};
 
 // Read files from /etc/ and populate etc::hosts & etc::ethers.
 void ReadConfig() {
   hosts = ReadHosts();
   ethers = ReadEthers(hosts);
+  resolv = ReadResolv();
 }
 
 } // namespace etc
@@ -1692,7 +1719,6 @@ struct QuestionEqual {
   }
 };
 
-// TODO: read /etc/resolv.conf in etc::ReadConfig instead of res_init in main
 // TODO: merge all "SendTo" functions into one
 // TODO: use std::variant to distinguish outgoing requests & cached entries
 // TODO: unify logging style:
@@ -1754,6 +1780,7 @@ const Entry *GetCachedEntry(const Question &question) {
 
 struct Client : epoll::Listener {
   uint16_t request_id;
+  int server_i = 0;
 
   uint16_t AllocateRequestId() {
     return request_id = htons(ntohs(request_id) + 1);
@@ -1792,10 +1819,17 @@ struct Client : epoll::Listener {
     len = recvfrom(fd, recvbuf, sizeof(recvbuf), 0,
                    (struct sockaddr *)&clientaddr, &clilen);
     IP source_ip(clientaddr.sin_addr.s_addr);
-    if (source_ip != dns_servers[0]) {
+    if (find(etc::resolv.begin(), etc::resolv.end(), source_ip) ==
+        etc::resolv.end()) {
+      string dns_servers = "";
+      for (const auto &server : etc::resolv) {
+        if (!dns_servers.empty()) {
+          dns_servers += " / ";
+        }
+        dns_servers += server.to_string();
+      }
       LOG << "DNS client received a packet from an unexpected source: "
-          << source_ip.to_string()
-          << " (expected: " << dns_servers[0].to_string() << ")";
+          << source_ip.to_string() << " (expected: " << dns_servers << ")";
       return;
     }
     uint16_t source_port = ntohs(clientaddr.sin_port);
@@ -1872,7 +1906,9 @@ const Entry &GetCachedEntryOrSendRequest(const Question &question,
     Header{.id = id, .recursion_desired = true, .question_count = htons(1)}
         .write_to(buffer);
     question.write_to(buffer);
-    client.SendTo(buffer, dns_servers[0], kServerPort, err);
+    IP upstream_ip =
+        etc::resolv[(++client.server_i) % etc::resolv.size()]; // Round-robin
+    client.SendTo(buffer, upstream_ip, kServerPort, err);
     if (err.empty()) {
       LOG << "Sending a DNS request to upstream server: "
           << question.to_string() << ". Currently " << cache.size()
@@ -2067,13 +2103,6 @@ int main(int argc, char *argv[]) {
   string err;
 
   epoll::Init();
-
-  res_init();
-  dns_servers.clear();
-  for (int i = 0; i < _res.nscount; ++i) {
-    sockaddr_in &entry = _res.nsaddr_list[i];
-    dns_servers.emplace_back(entry.sin_addr.s_addr);
-  }
 
   server_ip = IP::FromInterface(kInterfaceName);
   netmask = IP::NetmaskFromInterface(kInterfaceName);
