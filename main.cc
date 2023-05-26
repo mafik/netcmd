@@ -81,6 +81,18 @@ void SetNonBlocking(int fd, string &error) {
   }
 }
 
+void SendTo(int fd, const string &buffer, IP ip, uint16_t port, string &error) {
+  sockaddr_in dest_addr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(port),
+      .sin_addr = {.s_addr = ip.addr},
+  };
+  if (sendto(fd, buffer.data(), buffer.size(), 0, (struct sockaddr *)&dest_addr,
+             sizeof(dest_addr)) < 0) {
+    error = "sendto: " + string(strerror(errno));
+  }
+}
+
 template <typename Iter> Iter next(Iter iter) { return ++iter; }
 
 using chrono::steady_clock;
@@ -985,15 +997,7 @@ struct Server : epoll::Listener {
   }
 
   void SendTo(const string &buffer, IP ip, string &error) {
-    sockaddr_in dest_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(kClientPort),
-        .sin_addr = {.s_addr = ip.addr},
-    };
-    if (sendto(fd, buffer.data(), buffer.size(), 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-      error = "sendto: " + string(strerror(errno));
-    }
+    ::SendTo(fd, buffer, ip, kClientPort, error);
   }
 
   // Function used to validate IP addresses provided by clients.
@@ -1719,7 +1723,6 @@ struct QuestionEqual {
   }
 };
 
-// TODO: merge all "SendTo" functions into one
 // TODO: use std::variant to distinguish outgoing requests & cached entries
 // TODO: unify logging style:
 // For incoming requests:
@@ -1875,48 +1878,36 @@ struct Client : epoll::Listener {
     entry->HandleAnswer(msg, err);
   }
 
-  void SendTo(const string &buffer, IP ip, uint16_t port, string &error) {
-    sockaddr_in dest_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr = {.s_addr = ip.addr},
-    };
-    if (sendto(fd, buffer.data(), buffer.size(), 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-      error = "sendto: " + string(strerror(errno));
+  const Entry &GetCachedEntryOrSendRequest(const Question &question,
+                                           string &err) {
+    const Entry *entry = GetCachedEntry(question);
+    if (entry == nullptr) {
+      // Send a request to the upstream DNS server.
+      uint16_t id = AllocateRequestId();
+      Entry *new_entry = new Entry(id, question);
+      new_entry->UpdateExpiration(steady_clock::now() + 10s);
+      entry = new_entry;
+      cache.insert(entry);
+      string buffer;
+      Header{.id = id, .recursion_desired = true, .question_count = htons(1)}
+          .write_to(buffer);
+      question.write_to(buffer);
+      IP upstream_ip =
+          etc::resolv[(++server_i) % etc::resolv.size()]; // Round-robin
+      ::SendTo(fd, buffer, upstream_ip, kServerPort, err);
+      if (err.empty()) {
+        LOG << "Sending a DNS request to upstream server: "
+            << question.to_string() << ". Currently " << cache.size()
+            << " cached entries.";
+      }
     }
+    return *entry;
   }
 
   const char *Name() const override { return "dns::Client"; }
 };
 
 Client client;
-
-const Entry &GetCachedEntryOrSendRequest(const Question &question,
-                                         string &err) {
-  const Entry *entry = GetCachedEntry(question);
-  if (entry == nullptr) {
-    // Send a request to the upstream DNS server.
-    uint16_t id = client.AllocateRequestId();
-    Entry *new_entry = new Entry(id, question);
-    new_entry->UpdateExpiration(steady_clock::now() + 10s);
-    entry = new_entry;
-    cache.insert(entry);
-    string buffer;
-    Header{.id = id, .recursion_desired = true, .question_count = htons(1)}
-        .write_to(buffer);
-    question.write_to(buffer);
-    IP upstream_ip =
-        etc::resolv[(++client.server_i) % etc::resolv.size()]; // Round-robin
-    client.SendTo(buffer, upstream_ip, kServerPort, err);
-    if (err.empty()) {
-      LOG << "Sending a DNS request to upstream server: "
-          << question.to_string() << ". Currently " << cache.size()
-          << " cached entries.";
-    }
-  }
-  return *entry;
-}
 
 struct Server : epoll::Listener {
 
@@ -1977,15 +1968,7 @@ struct Server : epoll::Listener {
   }
 
   void SendTo(const string &buffer, IP ip, uint16_t port, string &error) {
-    sockaddr_in dest_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr = {.s_addr = ip.addr},
-    };
-    if (sendto(fd, buffer.data(), buffer.size(), 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-      error = "sendto: " + string(strerror(errno));
-    }
+    ::SendTo(fd, buffer, ip, port, error);
   }
 
   void NotifyRead(string &abort_error) override {
@@ -2021,7 +2004,7 @@ struct Server : epoll::Listener {
     LOG << "Request " << f("0x%04hx", msg.header.id) << " for "
         << msg.question.to_string();
     LOG_Indent();
-    const Entry &entry = GetCachedEntryOrSendRequest(msg.question, err);
+    const Entry &entry = client.GetCachedEntryOrSendRequest(msg.question, err);
     if (!err.empty()) {
       ERROR << err;
       return;
