@@ -1364,7 +1364,7 @@ struct Question {
 };
 
 struct Record : Question {
-  uint32_t ttl;
+  steady_clock::time_point expiration;
   uint16_t data_length;
   string data;
   size_t LoadFrom(const uint8_t *ptr, size_t len, size_t offset) {
@@ -1377,7 +1377,8 @@ struct Record : Question {
     if (offset + 6 > len) {
       return 0;
     }
-    ttl = ntohl(*(uint32_t *)(ptr + offset));
+    expiration = steady_clock::now() +
+                 chrono::seconds(ntohl(*(uint32_t *)(ptr + offset)));
     offset += 4;
     data_length = ntohs(*(uint16_t *)(ptr + offset));
     offset += 2;
@@ -1406,16 +1407,23 @@ struct Record : Question {
   }
   void write_to(string &buffer) const {
     Question::write_to(buffer);
-    uint32_t ttl_big_endian = htonl(ttl);
+    uint32_t ttl_big_endian = htonl(ttl());
     buffer.append((char *)&ttl_big_endian, sizeof(ttl_big_endian));
     uint16_t data_length_big_endian = htons(data_length);
     buffer.append((char *)&data_length_big_endian,
                   sizeof(data_length_big_endian));
     buffer.append(data);
   }
+  uint32_t ttl() const {
+    return expiration > steady_clock::now()
+               ? duration_cast<chrono::seconds>(expiration -
+                                                steady_clock::now())
+                     .count()
+               : 0;
+  }
   string to_string() const {
     return "dns::Record(" + Question::to_string() +
-           ", ttl=" + std::to_string(ttl) + ", data=\"" +
+           ", ttl=" + std::to_string(ttl()) + ", data=\"" +
            hex(data.data(), data.size()) + "\")";
   }
 };
@@ -1584,28 +1592,22 @@ struct Entry {
   mutable steady_clock::time_point expiration;
   mutable vector<IncomingRequest> incoming_requests;
 
+  // Constructs Entry in its valid state.
   Entry(Header::ResponseCode response_code, const Question &question,
-        const vector<Record> &answers)
+        const vector<Record> &answers, steady_clock::time_point expiration)
       : outgoing_id(), response_code(response_code), question(question),
-        answers(answers) {
-    steady_clock::duration shortest_ttl =
-        response_code == Header::NAME_ERROR ? 60s : 24h;
-    for (auto &answer : answers) {
-      steady_clock::duration ttl = chrono::seconds(answer.ttl);
-      if (ttl < shortest_ttl) {
-        shortest_ttl = ttl;
-      }
-    }
-    expiration = steady_clock::now() + shortest_ttl;
-  }
+        answers(answers), expiration(expiration) {}
+  // Constructs Entry in its in-progress state.
   Entry(uint16_t outgoing_id, const Question &question)
       : outgoing_id(outgoing_id), response_code(Header::NO_ERROR),
         question(question), answers() {
     expiration = steady_clock::now() + 10s;
   }
-  bool IsValid() const { return !answers.empty() || !outgoing_id.has_value(); }
+  bool AnswerAvailable() const {
+    return !answers.empty() || !outgoing_id.has_value();
+  }
   void HandleIncomingRequest(const IncomingRequest &request) const {
-    if (IsValid()) {
+    if (AnswerAvailable()) {
       LOG << "Answering request from cache: " << question.to_string();
       string err;
       AnswerRequest(request, *this, err);
@@ -1615,18 +1617,50 @@ struct Entry {
     } else {
       for (auto &r : incoming_requests) {
         if (r.client_ip == request.client_ip &&
-            r.client_port == request.client_port && r.header.id == request.header.id) {
-          LOG << "Ignoring duplicate request from " << request.client_ip.to_string()
-              << ":" << request.client_port << ": " << question.to_string();
+            r.client_port == request.client_port &&
+            r.header.id == request.header.id) {
+          LOG << "Ignoring duplicate request from "
+              << request.client_ip.to_string() << ":" << request.client_port
+              << ": " << question.to_string();
           return;
         }
       }
+      UpdateExpiration(steady_clock::now() + 10s);
       incoming_requests.push_back(request);
       LOG << "Adding incoming request to waitlist: " << question.to_string()
           << ". Currently " << incoming_requests.size()
           << " requests are waiting.";
     }
   }
+  void HandleAnswer(const Message &msg, string &err) const {
+    outgoing_id.reset();
+    response_code = msg.header.response_code;
+    answers = msg.answers;
+
+    steady_clock::time_point new_expiration =
+        steady_clock::now() +
+        (msg.header.response_code == Header::NAME_ERROR ? 60s : 24h);
+    for (auto &answer : msg.answers) {
+      if (answer.expiration < new_expiration) {
+        new_expiration = answer.expiration;
+      }
+    }
+
+    UpdateExpiration(new_expiration);
+
+    LOG << "Received DNS reply from upstream server: "
+        << msg.question.to_string() << ". Answering "
+        << incoming_requests.size() << " incoming requests.";
+
+    for (auto &inc_req : incoming_requests) {
+      AnswerRequest(inc_req, *this, err);
+      if (!err.empty()) {
+        break;
+      }
+    }
+    incoming_requests.clear();
+  }
+  void UpdateExpiration(steady_clock::time_point new_expiration) const;
   bool operator==(const Question &other) const { return question == other; }
 };
 
@@ -1647,25 +1681,56 @@ struct QuestionEqual {
   bool operator()(const Entry &a, const Entry &b) const {
     return a.question == b.question;
   }
-  bool operator()(Entry *a, Entry *b) const {
+  bool operator()(const Entry *a, const Entry *b) const {
     return a->question == b->question;
   }
   bool operator()(const Question &a, const Entry &b) const {
     return a == b.question;
   }
-  bool operator()(const Question &a, Entry *b) const {
+  bool operator()(const Question &a, const Entry *b) const {
     return a == b->question;
   }
 };
 
-// TODO: working expiration queue
 // TODO: read /etc/resolv.conf in etc::ReadConfig instead of res_init in main
 // TODO: merge all "SendTo" functions into one
-unordered_set<Entry *, QuestionHash, QuestionEqual> cache;
+// TODO: use std::variant to distinguish outgoing requests & cached entries
+// TODO: unify logging style:
+// For incoming requests:
+//   <id> <ip>:<port> Asks for <question>
+//   <id> <ip>:<port> Answering with <answers> (cached / from upstream)
+// For outgoing requests:
+//   Forwarding <question>
+//   Received <question> from upstream. Caching for <ttl> seconds
+//   Expiring <question>
+unordered_set<const Entry *, QuestionHash, QuestionEqual> cache;
 
 unordered_set<Entry, QuestionHash, QuestionEqual> static_cache;
 
-priority_queue<unique_ptr<Entry>> expiration_queue;
+multimap<steady_clock::time_point, const Entry *> expiration_queue;
+
+void Entry::UpdateExpiration(steady_clock::time_point new_expiration) const {
+  using iterator = decltype(expiration_queue)::iterator;
+  auto [begin, end] = expiration_queue.equal_range(expiration);
+  for (iterator it = begin; it != end; ++it) {
+    if (it->second == this) {
+      expiration_queue.erase(it);
+      break;
+    }
+  }
+  expiration = new_expiration;
+  expiration_queue.emplace(new_expiration, this);
+}
+
+void ExpireEntries() {
+  auto now = steady_clock::now();
+  while (!expiration_queue.empty() && expiration_queue.begin()->first < now) {
+    LOG << "Expiring entry: "
+        << expiration_queue.begin()->second->question.to_string();
+    cache.erase(expiration_queue.begin()->second);
+    expiration_queue.erase(expiration_queue.begin());
+  }
+}
 
 const Entry *GetCachedEntry(const Question &question) {
   if (question.domain_name.ends_with("." + kDomainName)) {
@@ -1674,7 +1739,8 @@ const Entry *GetCachedEntry(const Question &question) {
       it->expiration = steady_clock::now() + 1h;
       return &*it;
     }
-    static Entry name_not_found_entry(Header::NAME_ERROR, question, {});
+    static Entry name_not_found_entry(Header::NAME_ERROR, question, {},
+                                      steady_clock::time_point::min());
     name_not_found_entry.expiration = steady_clock::now() + 60s;
     return &name_not_found_entry;
   } else {
@@ -1689,7 +1755,7 @@ const Entry *GetCachedEntry(const Question &question) {
 struct Client : epoll::Listener {
   uint16_t request_id;
 
-  uint16_t GetNextRequestId() {
+  uint16_t AllocateRequestId() {
     return request_id = htons(ntohs(request_id) + 1);
   }
 
@@ -1718,6 +1784,7 @@ struct Client : epoll::Listener {
   }
 
   void NotifyRead(std::string &abort_error) override {
+    ExpireEntries();
     uint8_t recvbuf[65536] = {0};
     int len;
     struct sockaddr_in clientaddr;
@@ -1770,24 +1837,8 @@ struct Client : epoll::Listener {
           << " (expected: " << f("0x%04hx", entry->outgoing_id.value()) << ")";
       return;
     }
-    entry->outgoing_id.reset();
 
-    LOG << "Received DNS reply from upstream server: "
-        << msg.question.to_string();
-
-    entry->response_code = msg.header.response_code;
-    entry->answers = msg.answers;
-
-    for (auto &inc_req : entry->incoming_requests) {
-      AnswerRequest(inc_req, *entry, err);
-      if (!err.empty()) {
-        ERROR << err;
-        err = "";
-      }
-    }
-    LOG << "Answered " << entry->incoming_requests.size()
-        << " incoming requests with this reply.";
-    entry->incoming_requests.clear();
+    entry->HandleAnswer(msg, err);
   }
 
   void SendTo(const string &buffer, IP ip, uint16_t port, string &error) {
@@ -1812,10 +1863,11 @@ const Entry &GetCachedEntryOrSendRequest(const Question &question,
   const Entry *entry = GetCachedEntry(question);
   if (entry == nullptr) {
     // Send a request to the upstream DNS server.
-    uint16_t id = client.GetNextRequestId();
-    auto uniq = make_unique<Entry>(id, question);
-    entry = uniq.get();
-    cache.insert(uniq.get());
+    uint16_t id = client.AllocateRequestId();
+    Entry *new_entry = new Entry(id, question);
+    new_entry->UpdateExpiration(steady_clock::now() + 10s);
+    entry = new_entry;
+    cache.insert(entry);
     string buffer;
     Header{.id = id, .recursion_desired = true, .question_count = htons(1)}
         .write_to(buffer);
@@ -1826,7 +1878,6 @@ const Entry &GetCachedEntryOrSendRequest(const Question &question,
           << question.to_string() << ". Currently " << cache.size()
           << " cached entries.";
     }
-    expiration_queue.emplace(std::move(uniq));
   }
   return *entry;
 }
@@ -1902,6 +1953,7 @@ struct Server : epoll::Listener {
   }
 
   void NotifyRead(string &abort_error) override {
+    ExpireEntries();
     uint8_t recvbuf[65536] = {0};
     int len;
     struct sockaddr_in clientaddr;
@@ -1930,7 +1982,8 @@ struct Server : epoll::Listener {
       return;
     }
 
-    LOG << "Request " << f("0x%04hx", msg.header.id) << " for " << msg.question.to_string();
+    LOG << "Request " << f("0x%04hx", msg.header.id) << " for "
+        << msg.question.to_string();
     LOG_Indent();
     const Entry &entry = GetCachedEntryOrSendRequest(msg.question, err);
     if (!err.empty()) {
@@ -1983,9 +2036,10 @@ void Start(string &err) {
       string domain = alias + "." + kDomainName;
       string encoded_domain = EncodeDomainName(domain);
       Entry entry(Header::NO_ERROR, Question{.domain_name = domain},
-                  {Record{.ttl = 0,
+                  {Record{.expiration = steady_clock::time_point::min(),
                           .data_length = (uint16_t)encoded_domain.size(),
-                          .data = encoded_domain}});
+                          .data = encoded_domain}},
+                  steady_clock::time_point::min());
       static_cache.insert(entry);
     }
   }
