@@ -1,8 +1,10 @@
 #pragma once
 
 #include "epoll.hh"
+#include "ip.hh"
 
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -178,11 +180,17 @@ struct Server : epoll::Listener {
   // TODO: HTTP fuzz
   // TODO: WebSocket fuzz
 
+  struct Config {
+    IP ip = INADDR_ANY;
+    uint16_t port = 80;
+    std::optional<std::string> interface;
+  };
+
   // Start listening on a given port.
   //
   // To actually accept new connections, make sure to Poll the `epoll`
   // instance after listening.
-  void Listen(int port, std::string &error);
+  void Listen(Config config, std::string &error);
 
   // Stop listening.
   void StopListening();

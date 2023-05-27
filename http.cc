@@ -1,18 +1,18 @@
 #include "http.hh"
-#include "format.hh"
 #include "base64.hh"
+#include "format.hh"
 #include "log.hh"
 #include "sha.hh"
 #include <arpa/inet.h>
 #include <cassert>
 #include <cstring>
 #include <endian.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 // #define DEBUG_HTTP
 
@@ -258,7 +258,9 @@ static char read_buffer[1024 * 1024];
 static void TryReading(Connection &c) {
   ssize_t count = read(c.fd, read_buffer, sizeof(read_buffer));
 #ifdef DEBUG_HTTP
-  LOG << "read fd=" << c.fd << ", returned " << (int)count << " bytes, buffer size=" << (int)(c.request_buffer.size() + count) << " bytes";
+  LOG << "read fd=" << c.fd << ", returned " << (int)count
+      << " bytes, buffer size=" << (int)(c.request_buffer.size() + count)
+      << " bytes";
 #endif
   if (count == 0) { // EOF
 #ifdef DEBUG_HTTP
@@ -376,11 +378,9 @@ void Connection::NotifyWrite(std::string &error) {
   }
 }
 
-const char* Connection::Name() const {
-  return "Connection";
-}
+const char *Connection::Name() const { return "Connection"; }
 
-void Server::Listen(int port, std::string &error) {
+void Server::Listen(Config config, std::string &error) {
   fd = socket(AF_INET, SOCK_STREAM, /*protocol*/ 0);
   if (fd == 0) {
     error = "socket() failed";
@@ -408,9 +408,18 @@ void Server::Listen(int port, std::string &error) {
     return;
   }
 
+  if (config.interface.has_value()) {
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, config.interface->data(),
+                   config.interface->size()) < 0) {
+      error = "Error when setsockopt bind to device";
+      StopListening();
+      return;
+    };
+  }
+
   sockaddr_in address = {.sin_family = AF_INET,
-                         .sin_port = htons(port),
-                         .sin_addr = {.s_addr = htonl(INADDR_ANY)}};
+                         .sin_port = htons(config.port),
+                         .sin_addr = {.s_addr = config.ip.addr}};
   if (int r = bind(fd, (sockaddr *)&address, sizeof(address)); r < 0) {
     error = "bind() failed";
     StopListening();
@@ -441,7 +450,8 @@ void Server::NotifyRead(std::string &error) {
   while (true) {
     sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    int conn_fd = accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+    int conn_fd =
+        accept4(fd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
     if (conn_fd == -1) {
       if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
         // We have processed all incoming connections.
@@ -470,9 +480,7 @@ void Server::NotifyRead(std::string &error) {
   }
 }
 
-const char* Server::Name() const {
-  return "Server";
-}
+const char *Server::Name() const { return "Server"; }
 
 } // namespace http
 

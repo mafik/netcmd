@@ -35,8 +35,10 @@
 #include "epoll.hh"
 #include "format.hh"
 #include "hex.hh"
+#include "http.hh"
+#include "ip.hh"
 #include "log.hh"
-#include "net_types.hh"
+#include "mac.hh"
 #include "random.hh"
 
 using namespace std;
@@ -258,15 +260,24 @@ vector<IP> ReadResolv() {
   return resolv;
 }
 
+string ReadHostname() {
+  ifstream hostname_stream("/etc/hostname");
+  string hostname;
+  getline(hostname_stream, hostname);
+  return hostname;
+}
+
 map<IP, vector<string>> hosts;
 map<MAC, IP> ethers;
 vector<IP> resolv = {IP(8, 8, 8, 8), IP(8, 8, 4, 4)};
+string hostname = "localhost";
 
 // Read files from /etc/ and populate etc::hosts & etc::ethers.
 void ReadConfig() {
   hosts = ReadHosts();
   ethers = ReadEthers(hosts);
   resolv = ReadResolv();
+  hostname = ReadHostname();
 }
 
 } // namespace etc
@@ -1399,9 +1410,13 @@ struct Question {
     return (domain_name == other.domain_name) && (type == other.type) &&
            (class_ == other.class_);
   }
+  string to_html() const {
+    return "<code class=\"dns-question\">" + domain_name + " " +
+           TypeToString(type) + "</code>";
+  }
 };
 
-struct Record : Question {
+struct Record : public Question {
   steady_clock::time_point expiration;
   uint16_t data_length;
   string data;
@@ -1463,6 +1478,28 @@ struct Record : Question {
     return "dns::Record(" + Question::to_string() +
            ", ttl=" + std::to_string(ttl()) + ", data=\"" +
            hex(data.data(), data.size()) + "\")";
+  }
+  string pretty_value() const {
+    if (type == Type::A) {
+      if (data.size() == 4) {
+        return std::to_string((uint8_t)data[0]) + "." +
+               std::to_string((uint8_t)data[1]) + "." +
+               std::to_string((uint8_t)data[2]) + "." +
+               std::to_string((uint8_t)data[3]);
+      }
+    } else if (type == Type::CNAME) {
+      auto [loaded_name, loaded_size] =
+          LoadDomainName((const uint8_t *)data.data(), data.size(), 0);
+      if (loaded_size == data.size()) {
+        return loaded_name;
+      }
+    }
+    return hex(data.data(), data.size());
+  }
+  string to_html() const {
+    return "<code class=\"dns-record\" title=\"TTL=" + std::to_string(ttl()) +
+           "s\" style=\"display: inline-block\">" + domain_name + " " +
+           TypeToString(type) + " " + pretty_value() + "</code>";
   }
 };
 
@@ -1625,6 +1662,23 @@ struct Entry {
   struct Ready {
     Header::ResponseCode response_code;
     vector<Record> answers;
+    string to_string() const {
+      string r = "Ready(" + string(Header::ResponseCodeToString(response_code));
+      for (const Record &a : answers) {
+        r += "  " + a.to_string();
+      }
+      r += ")";
+      return r;
+    }
+    string to_html() const {
+      string r = "<code>" +
+                 string(Header::ResponseCodeToString(response_code)) +
+                 "</code>";
+      for (const Record &a : answers) {
+        r += "&nbsp;" + a.to_html();
+      }
+      return r;
+    }
   };
   struct Pending {
     uint16_t outgoing_id;
@@ -1635,16 +1689,6 @@ struct Entry {
   mutable steady_clock::time_point expiration;
   mutable variant<Ready, Pending> state;
 
-  // Constructs Entry in its valid state.
-  static Entry MakeReady(const Question &question,
-                         Header::ResponseCode response_code,
-                         const vector<Record> &answers) {
-    return Entry{
-        .question = question,
-        .expiration = steady_clock::time_point::max(),
-        .state = Ready{response_code, answers},
-    };
-  }
   void HandleIncomingRequest(const IncomingRequest &request) const {
     visit(overloaded{
               [&](Ready &r) {
@@ -1748,7 +1792,7 @@ struct QuestionEqual {
   }
 };
 
-// TODO: unify logging style:
+// Logging style:
 // For incoming requests:
 //   <id> <ip>:<port> Asks for <question>
 //   <id> <ip>:<port> Answering with <answers> (cached / from upstream)
@@ -1756,6 +1800,7 @@ struct QuestionEqual {
 //   Forwarding <question>
 //   Received <question> from upstream. Caching for <ttl> seconds
 //   Expiring <question>
+
 unordered_set<const Entry *, QuestionHash, QuestionEqual> cache;
 
 unordered_set<Entry, QuestionHash, QuestionEqual> static_cache;
@@ -2081,6 +2126,9 @@ void AnswerRequest(const IncomingRequest &request, const Entry &e,
 void Start(string &err) {
   client.request_id = random<uint16_t>();
   for (auto &[ip, aliases] : etc::hosts) {
+    if (ip.bytes[0] == 127) {
+      continue;
+    }
     for (auto &alias : aliases) {
       string domain = alias + "." + kDomainName;
       string encoded_domain = EncodeDomainName(domain);
@@ -2089,9 +2137,10 @@ void Start(string &err) {
           .expiration = steady_clock::time_point::max(),
           .state = Entry::Ready{
               .response_code = Header::NO_ERROR,
-              .answers = {Record{.expiration = steady_clock::time_point::max(),
-                                 .data_length = (uint16_t)encoded_domain.size(),
-                                 .data = encoded_domain}}}});
+              .answers = {Record{Question{.domain_name = domain},
+                                 steady_clock::time_point::max(),
+                                 (uint16_t)sizeof(ip.addr),
+                                 string((char *)&ip.addr, sizeof(ip.addr))}}}});
     }
   }
   client.Listen(err);
@@ -2110,10 +2159,148 @@ void Start(string &err) {
 
 namespace http {
 
-void StartServer() {}
+static constexpr int kPort = 1337;
+Server server;
+
+void Handler(Response &response, Request &request) {
+  steady_clock::time_point now = steady_clock::now();
+  string html;
+  html.reserve(1024 * 64);
+  auto $ = [&](const char *tag, function<void()> inner) {
+    html += "<";
+    html += tag;
+    html += ">";
+    inner();
+    html += "</";
+    html += tag;
+    html += ">";
+  };
+  auto h2 = [&](const char *h) { $("h2", [&]() { html += h; }); };
+  auto h3 = [&](const char *h) { $("h3", [&]() { html += h; }); };
+  auto line = [&](const char *name, const string &value) {
+    html += "<p>";
+    html += name;
+    html += ": <code>";
+    html += value;
+    html += "</code></p>";
+  };
+  html += "<!doctype html>";
+  html += "<html><head><title>Gatekeeper</title><meta http-equiv=\"refresh\" "
+          "content=\"1\"></head><body>";
+  html += "<h1>Gatekeeper</h1>";
+  html += R"(<button onclick="window.stop();">Stop refreshing</button>)";
+  h2("Config");
+  line("interface", kInterfaceName);
+  line("domain_name", kDomainName);
+  line("server_ip", server_ip.to_string());
+  line("netmask", netmask.to_string());
+  h2("/etc/");
+  line("hostname", etc::hostname);
+  h3("hosts");
+  $("ul", [&]() {
+    for (auto &[ip, aliases] : etc::hosts) {
+      $("li", [&]() {
+        $("code", [&]() { html += ip.to_string(); });
+        $("ul", [&]() {
+          for (auto &alias : aliases) {
+            $("li", [&]() { html += alias; });
+          }
+        });
+      });
+    }
+  });
+  h3("ethers");
+  $("ul", [&]() {
+    for (auto &[mac, ip] : etc::ethers) {
+      $("li", [&]() {
+        $("code", [&]() { html += mac.to_string(); });
+        html += " -> ";
+        $("code", [&]() { html += ip.to_string(); });
+      });
+    }
+  });
+  h3("resolv.conf");
+  $("ul", [&]() {
+    for (auto &ip : etc::resolv) {
+      $("li", [&]() { $("code", [&]() { html += ip.to_string(); }); });
+    }
+  });
+
+  h2("DHCP");
+  html += "<table><tr><th>IP</th><th>Client "
+          "ID</th><th>Hostname</th><th>Expiration</th></tr>";
+  for (auto &[ip, entry] : dhcp::server.entries) {
+    html += "<tr>";
+    html += "<td>";
+    html += ip.to_string();
+    html += "</td>";
+    html += "<td>";
+    html += entry.client_id;
+    html += "</td>";
+    html += "<td>";
+    html += entry.hostname;
+    html += "</td>";
+    html += "<td>";
+    html += to_string(
+        duration_cast<chrono::seconds>(entry.expiration - now).count());
+    html += "</td>";
+    html += "</tr>";
+  }
+  html += "</table>";
+
+  h2("DNS");
+  auto emit_dns_entry = [&](const dns::Entry &entry) {
+    html += "<tr><td>";
+    html += entry.question.to_html();
+    html += "</td><td>";
+    html += to_string(
+        duration_cast<chrono::seconds>(entry.expiration - now).count());
+    html += "</td><td>";
+    visit(overloaded{
+              [&](const dns::Entry::Ready &ready) { html += ready.to_html(); },
+              [&](const dns::Entry::Pending &pending) { html += "Pending"; }},
+          entry.state);
+    html += "</td></tr>";
+  };
+
+  html += "<table><caption>Static "
+          "cache</caption><tr><th>Question</th><th>Expiration</th><th>State</"
+          "th></tr>";
+  for (auto &entry : dns::static_cache) {
+    emit_dns_entry(entry);
+  }
+  html += "</table>";
+
+  html += "<table><caption>Dynamic "
+          "cache</caption><tr><th>Question</th><th>Expiration</th><th>State</"
+          "th></tr>";
+  for (auto *entry_ptr : dns::cache) {
+    emit_dns_entry(*entry_ptr);
+  }
+  html += "</table>";
+
+  h2("HTTP request");
+  $("pre", [&]() { html += request.buffer; });
+  html += "</body></html>";
+  response.Write(html);
+}
+
+void Start(string &err) {
+  server.handler = Handler;
+  server.Listen(http::Server::Config{.ip = server_ip,
+                                     .port = http::kPort,
+                                     .interface = kInterfaceName},
+                err);
+  if (!err.empty()) {
+    return;
+  }
+}
 
 } // namespace http
 
+// TODO: pretty style
+// TODO: DHCP NAK when requested IP mismatches desired IP
+// TODO: rename to Gatekeeper
 int main(int argc, char *argv[]) {
   string err;
 
@@ -2135,7 +2322,11 @@ int main(int argc, char *argv[]) {
     FATAL << err;
   }
 
-  http::StartServer();
+  http::Start(err);
+  if (!err.empty()) {
+    FATAL << err;
+  }
+
   LOG << "Starting epoll::Loop()";
   epoll::Loop(err);
   if (!err.empty()) {
