@@ -1,0 +1,43 @@
+html {
+  text-size-adjust: 100%;
+}
+code, pre, html {
+  font-family: system-ui, sans-serif;
+}
+table > caption {
+  font-weight: bold;
+  font-style: italic;
+  font-size: 1.2em;
+}
+table {
+  /* border-collapse: collapse; */
+  border: 1px solid #ccc;
+  margin: .5em;
+  float: left;
+}
+td, th {
+  border: 1px solid #ccc;
+  padding: 0.5rem;
+}
+pre {
+  margin: 0;
+}
+.stop-refreshing {
+  position: fixed;
+  top: .5em;
+  right: .5em;
+}
+.dns-question, .dns-record {
+  padding: .1em .5em;
+  border-radius: .5em;
+  display: inline-block;
+
+}
+.dns-question {
+  background: #ede9ff;
+  border: 1px solid #c1afff;
+}
+.dns-record {
+  border: 1px solid rgb(147, 240, 147);
+  background: rgb(225, 255, 225);
+}

@@ -1,8 +1,7 @@
-// NetworkCommander is a DHCP, proxy DNS & mDNS server for home networks. It's
+// Gatekeeper is a combined DHCP server & DNS proxy for home networks. It's
 // designed to run on the gateway router of a home network. It's web interface
-// allows the user to easily inspect the state of the network - what devices are
-// connected, snoop on DNS requests by IoT devices, check NAT masquerades,
-// forward ports, etc.
+// allows the user to easily inspect the state of the network: see what devices
+// are connected and snoop on DNS requests by IoT devices.
 
 #include <algorithm>
 #include <chrono>
@@ -2163,124 +2162,133 @@ static constexpr int kPort = 1337;
 Server server;
 
 void Handler(Response &response, Request &request) {
+  if (request.path == "/style.css") {
+    int f = open("style.css", O_RDONLY);
+    if (f == -1) {
+      response.WriteStatus("500 Internal Server Error");
+      response.Write("Failed to open style.css");
+      return;
+    }
+    char buf[1024 * 64];
+    int len = read(f, buf, sizeof(buf));
+    close(f);
+    if (len == -1) {
+      response.WriteStatus("500 Internal Server Error");
+      response.Write("Failed to read style.css");
+      return;
+    }
+    response.Write(string_view(buf, len));
+    return;
+  }
   steady_clock::time_point now = steady_clock::now();
   string html;
   html.reserve(1024 * 64);
-  auto $ = [&](const char *tag, function<void()> inner) {
-    html += "<";
-    html += tag;
-    html += ">";
-    inner();
-    html += "</";
-    html += tag;
-    html += ">";
-  };
-  auto h2 = [&](const char *h) { $("h2", [&]() { html += h; }); };
-  auto h3 = [&](const char *h) { $("h3", [&]() { html += h; }); };
-  auto line = [&](const char *name, const string &value) {
-    html += "<p>";
-    html += name;
-    html += ": <code>";
-    html += value;
-    html += "</code></p>";
-  };
   html += "<!doctype html>";
-  html += "<html><head><title>Gatekeeper</title><meta http-equiv=\"refresh\" "
+  html += "<html><head><title>Gatekeeper</title><link rel=\"stylesheet\" "
+          "href=\"/style.css\"><meta http-equiv=\"refresh\" "
           "content=\"1\"></head><body>";
   html += "<h1>Gatekeeper</h1>";
-  html += R"(<button onclick="window.stop();">Stop refreshing</button>)";
-  h2("Config");
-  line("interface", kInterfaceName);
-  line("domain_name", kDomainName);
-  line("server_ip", server_ip.to_string());
-  line("netmask", netmask.to_string());
-  h2("/etc/");
-  line("hostname", etc::hostname);
-  h3("hosts");
-  $("ul", [&]() {
-    for (auto &[ip, aliases] : etc::hosts) {
-      $("li", [&]() {
-        $("code", [&]() { html += ip.to_string(); });
-        $("ul", [&]() {
-          for (auto &alias : aliases) {
-            $("li", [&]() { html += alias; });
-          }
-        });
-      });
+  html +=
+      R"(<button class="stop-refreshing" onclick="window.stop();">Stop refreshing</button>)";
+  auto table = [&](const char *caption, initializer_list<const char *> headers,
+                   function<void()> inner) {
+    html += "<table><caption>";
+    html += caption;
+    html += "</caption>";
+    if (headers.size()) {
+      html += "<tr>";
+      for (auto &h : headers) {
+        html += "<th>";
+        html += h;
+        html += "</th>";
+      }
+      html += "</tr>";
     }
-  });
-  h3("ethers");
-  $("ul", [&]() {
-    for (auto &[mac, ip] : etc::ethers) {
-      $("li", [&]() {
-        $("code", [&]() { html += mac.to_string(); });
-        html += " -> ";
-        $("code", [&]() { html += ip.to_string(); });
-      });
-    }
-  });
-  h3("resolv.conf");
-  $("ul", [&]() {
-    for (auto &ip : etc::resolv) {
-      $("li", [&]() { $("code", [&]() { html += ip.to_string(); }); });
-    }
-  });
-
-  h2("DHCP");
-  html += "<table><tr><th>IP</th><th>Client "
-          "ID</th><th>Hostname</th><th>Expiration</th></tr>";
-  for (auto &[ip, entry] : dhcp::server.entries) {
-    html += "<tr>";
-    html += "<td>";
-    html += ip.to_string();
-    html += "</td>";
-    html += "<td>";
-    html += entry.client_id;
-    html += "</td>";
-    html += "<td>";
-    html += entry.hostname;
-    html += "</td>";
-    html += "<td>";
-    html += to_string(
-        duration_cast<chrono::seconds>(entry.expiration - now).count());
-    html += "</td>";
-    html += "</tr>";
-  }
-  html += "</table>";
-
-  h2("DNS");
-  auto emit_dns_entry = [&](const dns::Entry &entry) {
-    html += "<tr><td>";
-    html += entry.question.to_html();
-    html += "</td><td>";
-    html += to_string(
-        duration_cast<chrono::seconds>(entry.expiration - now).count());
-    html += "</td><td>";
-    visit(overloaded{
-              [&](const dns::Entry::Ready &ready) { html += ready.to_html(); },
-              [&](const dns::Entry::Pending &pending) { html += "Pending"; }},
-          entry.state);
-    html += "</td></tr>";
+    inner();
+    html += "</table>";
   };
+  table("Config", {"Key", "Value"}, [&]() {
+    auto row = [&](const char *key, const string &value) {
+      html += "<tr><td>";
+      html += key;
+      html += "</td><td>";
+      html += value;
+      html += "</td></tr>";
+    };
+    row("interface", kInterfaceName);
+    row("domain_name", kDomainName);
+    row("server_ip", server_ip.to_string());
+    row("netmask", netmask.to_string());
+    row("/etc/hostname", etc::hostname);
+  });
+  table("/etc/hosts", {"hostname", "IP"}, [&]() {
+    for (auto &[ip, aliases] : etc::hosts) {
+      for (auto &alias : aliases) {
+        html += "<tr><td>";
+        html += alias;
+        html += "</td><td>";
+        html += ip.to_string();
+        html += "</td></tr>";
+      }
+    }
+  });
+  table("/etc/ethers", {"MAC", "IP"}, [&]() {
+    for (auto &[mac, ip] : etc::ethers) {
+      html += "<tr><td>";
+      html += mac.to_string();
+      html += "</td><td>";
+      html += ip.to_string();
+      html += "</td></tr>";
+    }
+  });
+  table("/etc/resolv.conf", {"IP"}, [&]() {
+    for (auto &ip : etc::resolv) {
+      html += "<tr><td>";
+      html += ip.to_string();
+      html += "</td></tr>";
+    }
+  });
+  table("DHCP", {"IP", "Client ID", "Hostname", "TTL"}, [&]() {
+    for (auto &[ip, entry] : dhcp::server.entries) {
+      html += "<tr><td>";
+      html += ip.to_string();
+      html += "</td><td>";
+      html += entry.client_id;
+      html += "</td><td>";
+      html += entry.hostname;
+      html += "</td><td>";
+      html += to_string(
+          duration_cast<chrono::seconds>(entry.expiration - now).count());
+      html += "</td></tr>";
+    }
+  });
+  table("DNS cache", {"Question", "TTL", "State"}, [&]() {
+    auto emit_dns_entry = [&](const dns::Entry &entry) {
+      html += "<tr><td>";
+      html += entry.question.to_html();
+      html += "</td><td>";
+      html += to_string(
+          duration_cast<chrono::seconds>(entry.expiration - now).count());
+      html += "</td><td>";
+      visit(overloaded{
+                [&](const dns::Entry::Ready &ready) { html += ready.to_html(); },
+                [&](const dns::Entry::Pending &pending) { html += "Pending"; }},
+            entry.state);
+      html += "</td></tr>";
+    };
 
-  html += "<table><caption>Static "
-          "cache</caption><tr><th>Question</th><th>Expiration</th><th>State</"
-          "th></tr>";
-  for (auto &entry : dns::static_cache) {
-    emit_dns_entry(entry);
-  }
-  html += "</table>";
-
-  html += "<table><caption>Dynamic "
-          "cache</caption><tr><th>Question</th><th>Expiration</th><th>State</"
-          "th></tr>";
-  for (auto *entry_ptr : dns::cache) {
-    emit_dns_entry(*entry_ptr);
-  }
-  html += "</table>";
-
-  h2("HTTP request");
-  $("pre", [&]() { html += request.buffer; });
+    for (auto &entry : dns::static_cache) {
+      emit_dns_entry(entry);
+    }
+    for (auto &entry : dns::cache) {
+      emit_dns_entry(*entry);
+    }
+  });
+  table("HTTP Request", {}, [&]() {
+    html += "<tr><td><pre>";
+    html += request.buffer;
+    html += "</pre></td></tr>";
+  });
   html += "</body></html>";
   response.Write(html);
 }
@@ -2298,7 +2306,6 @@ void Start(string &err) {
 
 } // namespace http
 
-// TODO: pretty style
 // TODO: DHCP NAK when requested IP mismatches desired IP
 // TODO: rename to Gatekeeper
 int main(int argc, char *argv[]) {
