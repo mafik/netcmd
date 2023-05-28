@@ -41,12 +41,13 @@
 #include "random.hh"
 
 using namespace std;
+using chrono::steady_clock;
 
 // User Config
 const string kInterfaceName = "enxe8802ee74415"; // "enp0s31f6";
 const string kDomainName = "local";
 
-// Default values, which will be overwritten during startup.
+// Default values will be overwritten during startup.
 // Those values could actually be fetched from the kernel each time they're
 // needed. This might be useful if the network configuration changes while the
 // program is running. If this ever becomes a problem, just remove those
@@ -66,6 +67,37 @@ std::string IndentString(std::string in, int spaces = 2) {
     }
   }
   return out;
+}
+
+
+string FormatDuration(optional<steady_clock::duration> d_opt, const char* never = "∞") {
+  if (!d_opt) {
+    return never;
+  }
+  steady_clock::duration& d = *d_opt;
+  string r;
+  auto h = duration_cast<chrono::hours>(d);
+  d -= h;
+  if (h.count() > 0) {
+    r += std::to_string(h.count()) + "h";
+  }
+  auto m = duration_cast<chrono::minutes>(d);
+  d -= m;
+  if (m.count() > 0) {
+    if (!r.empty()) {
+      r += " ";
+    }
+    r += std::to_string(m.count()) + "m";
+  }
+  auto s = duration_cast<chrono::seconds>(d);
+  d -= s;
+  if (r.empty() || (s.count() > 0)) {
+    if (!r.empty()) {
+      r += " ";
+    }
+    r += std::to_string(s.count()) + "s";
+  }
+  return r;
 }
 
 void SetNonBlocking(int fd, string &error) {
@@ -103,7 +135,6 @@ template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 template <typename Iter> Iter next(Iter iter) { return ++iter; }
 
-using chrono::steady_clock;
 
 namespace rfc1700 {
 
@@ -677,7 +708,7 @@ struct __attribute__((__packed__)) MessageType : Base {
     if (value < VALUE_COUNT) {
       return kValueNames[value];
     }
-    return "UNKNOWN";
+    return f("UNKNOWN(%d)", value);
   }
   const Value value;
   MessageType(Value value) : Base(OptionCode_MessageType, 1), value(value) {}
@@ -937,7 +968,9 @@ struct Server : epoll::Listener {
   struct Entry {
     string client_id;
     string hostname;
-    steady_clock::time_point expiration;
+    optional<steady_clock::time_point> expiration;
+    bool stable = false;
+    optional<steady_clock::time_point> last_request;
   };
 
   map<IP, Entry> entries;
@@ -946,7 +979,7 @@ struct Server : epoll::Listener {
     for (auto [mac, ip] : etc::ethers) {
       auto &entry = entries[ip];
       entry.client_id = mac.to_string();
-      entry.expiration = steady_clock::time_point::max(); // never expire
+      entry.stable = true;
       if (auto etc_hosts_it = etc::hosts.find(ip);
           etc_hosts_it != etc::hosts.end()) {
         auto &aliases = etc_hosts_it->second;
@@ -1061,7 +1094,7 @@ struct Server : epoll::Listener {
       if (auto it = entries.find(requested_ip); it != entries.end()) {
         Entry &entry = it->second;
         if ((entry.client_id != client_id) &&
-            (entry.expiration > steady_clock::now())) {
+            (entry.expiration ? entry.expiration > steady_clock::now() : true)) {
           // Requested IP is taken by another client.
           ok = false;
         }
@@ -1085,9 +1118,9 @@ struct Server : epoll::Listener {
         steady_clock::time_point::max();
     for (auto it : entries) {
       const Entry &entry = it.second;
-      if (entry.expiration < oldest_expiration) {
+      if (entry.expiration && *entry.expiration < oldest_expiration) {
         oldest_ip = it.first;
-        oldest_expiration = entry.expiration;
+        oldest_expiration = *entry.expiration;
       }
     }
     if (oldest_expiration < steady_clock::now()) {
@@ -1230,11 +1263,12 @@ struct Server : epoll::Listener {
     }
 
     if (!inform) {
-      auto &lease = entries[chosen_ip];
-      lease.client_id = packet.client_id();
-      lease.expiration = steady_clock::now() + lease_time;
+      auto &entry = entries[chosen_ip];
+      entry.client_id = packet.client_id();
+      entry.last_request = steady_clock::now();
+      entry.expiration = steady_clock::now() + lease_time;
       if (auto opt = packet.FindOption<options::HostName>()) {
-        lease.hostname = opt->hostname();
+        entry.hostname = opt->hostname();
       }
     }
   }
@@ -1249,6 +1283,7 @@ Server server;
 namespace dns {
 
 static constexpr uint16_t kServerPort = 53;
+static constexpr steady_clock::duration kAuthoritativeTTL = 60s;
 
 #define BIG_ENDIAN_16(x) ((x >> 8) | (x << 8))
 
@@ -1265,7 +1300,7 @@ enum class Type : uint16_t {
   ANY = BIG_ENDIAN_16(255),
 };
 
-const char *TypeToString(Type t) {
+string TypeToString(Type t) {
   switch (t) {
   case Type::A:
     return "A";
@@ -1288,7 +1323,7 @@ const char *TypeToString(Type t) {
   case Type::ANY:
     return "ANY";
   default:
-    return "UNKNOWN";
+    return f("UNKNOWN(%hu)", (uint16_t)t);
   }
 }
 
@@ -1402,7 +1437,7 @@ struct Question {
   }
   string to_string() const {
     return "dns::Question(" + domain_name +
-           ", type=" + string(TypeToString(type)) +
+           ", type=" + TypeToString(type) +
            ", class=" + string(ClassToString(class_)) + ")";
   }
   bool operator==(const Question &other) const {
@@ -1416,7 +1451,7 @@ struct Question {
 };
 
 struct Record : public Question {
-  steady_clock::time_point expiration;
+  variant<steady_clock::time_point, steady_clock::duration> expiration;
   uint16_t data_length;
   string data;
   size_t LoadFrom(const uint8_t *ptr, size_t len, size_t offset) {
@@ -1467,11 +1502,18 @@ struct Record : public Question {
     buffer.append(data);
   }
   uint32_t ttl() const {
-    return expiration > steady_clock::now()
-               ? duration_cast<chrono::seconds>(expiration -
-                                                steady_clock::now())
-                     .count()
-               : 0;
+    return visit(
+        overloaded{
+            [&](steady_clock::time_point expiration) {
+              steady_clock::duration d = expiration - steady_clock::now();
+              return (uint32_t)max(d.count(), 0l);
+            },
+            [&](steady_clock::duration expiration) {
+              return (uint32_t)duration_cast<chrono::seconds>(expiration)
+                  .count();
+            },
+        },
+        expiration);
   }
   string to_string() const {
     return "dns::Record(" + Question::to_string() +
@@ -1685,7 +1727,7 @@ struct Entry {
   };
 
   Question question;
-  mutable steady_clock::time_point expiration;
+  mutable optional<steady_clock::time_point> expiration;
   mutable variant<Ready, Pending> state;
 
   void HandleIncomingRequest(const IncomingRequest &request) const {
@@ -1741,8 +1783,13 @@ struct Entry {
         steady_clock::now() +
         (msg.header.response_code == Header::NAME_ERROR ? 60s : 24h);
     for (auto &answer : msg.answers) {
-      if (answer.expiration < new_expiration) {
-        new_expiration = answer.expiration;
+      auto record_expiration =
+          get_if<steady_clock::time_point>(&answer.expiration);
+      if (record_expiration == nullptr) {
+        continue;
+      }
+      if (*record_expiration < new_expiration) {
+        new_expiration = *record_expiration;
       }
     }
 
@@ -1807,12 +1854,13 @@ unordered_set<Entry, QuestionHash, QuestionEqual> static_cache;
 multimap<steady_clock::time_point, const Entry *> expiration_queue;
 
 void Entry::UpdateExpiration(steady_clock::time_point new_expiration) const {
-  using iterator = decltype(expiration_queue)::iterator;
-  auto [begin, end] = expiration_queue.equal_range(expiration);
-  for (iterator it = begin; it != end; ++it) {
-    if (it->second == this) {
-      expiration_queue.erase(it);
-      break;
+  if (expiration) {
+    auto [begin, end] = expiration_queue.equal_range(*expiration);
+    for (auto it = begin; it != end; ++it) {
+      if (it->second == this) {
+        expiration_queue.erase(it);
+        break;
+      }
     }
   }
   expiration = new_expiration;
@@ -2122,26 +2170,31 @@ void AnswerRequest(const IncomingRequest &request, const Entry &e,
   server.SendTo(buffer, request.client_ip, request.client_port, err);
 }
 
+void InjectAuthoritativeEntry(const string &domain, IP ip) {
+  string encoded_domain = EncodeDomainName(domain);
+  static_cache.insert(Entry{
+      .question = Question{.domain_name = domain},
+      .expiration = std::nullopt,
+      .state = Entry::Ready{
+          .response_code = Header::NO_ERROR,
+          .answers = {Record{Question{.domain_name = domain}, kAuthoritativeTTL,
+                             (uint16_t)sizeof(ip.addr),
+                             string((char *)&ip.addr, sizeof(ip.addr))}}}});
+}
+
 void Start(string &err) {
-  client.request_id = random<uint16_t>();
+  client.request_id = random<uint16_t>(); // randomize initial request ID
+
   for (auto &[ip, aliases] : etc::hosts) {
     if (ip.bytes[0] == 127) {
       continue;
     }
     for (auto &alias : aliases) {
       string domain = alias + "." + kDomainName;
-      string encoded_domain = EncodeDomainName(domain);
-      static_cache.insert(Entry{
-          .question = Question{.domain_name = domain},
-          .expiration = steady_clock::time_point::max(),
-          .state = Entry::Ready{
-              .response_code = Header::NO_ERROR,
-              .answers = {Record{Question{.domain_name = domain},
-                                 steady_clock::time_point::max(),
-                                 (uint16_t)sizeof(ip.addr),
-                                 string((char *)&ip.addr, sizeof(ip.addr))}}}});
+      InjectAuthoritativeEntry(domain, ip);
     }
   }
+  InjectAuthoritativeEntry(etc::hostname + "." + kDomainName, server_ip);
   client.Listen(err);
   if (!err.empty()) {
     err = "Failed to start DNS client: " + err;
@@ -2248,7 +2301,7 @@ void Handler(Response &response, Request &request) {
       html += "</td></tr>";
     }
   });
-  table("DHCP", {"IP", "Client ID", "Hostname", "TTL"}, [&]() {
+  table("DHCP", {"IP", "Client ID", "Hostname", "TTL", "Last activity", "Stable"}, [&]() {
     for (auto &[ip, entry] : dhcp::server.entries) {
       html += "<tr><td>";
       html += ip.to_string();
@@ -2257,8 +2310,11 @@ void Handler(Response &response, Request &request) {
       html += "</td><td>";
       html += entry.hostname;
       html += "</td><td>";
-      html += to_string(
-          duration_cast<chrono::seconds>(entry.expiration - now).count());
+      html += FormatDuration(entry.expiration.transform([&](auto e) { return e - now; }));
+      html += "</td><td>";
+      html += FormatDuration(entry.last_request.transform([&](auto x) { return x - now; }), "never");
+      html += "</td><td>";
+      html += entry.stable ? "✓" : "";
       html += "</td></tr>";
     }
   });
@@ -2267,13 +2323,13 @@ void Handler(Response &response, Request &request) {
       html += "<tr><td>";
       html += entry.question.to_html();
       html += "</td><td>";
-      html += to_string(
-          duration_cast<chrono::seconds>(entry.expiration - now).count());
+      html += FormatDuration(entry.expiration.transform([&](auto e) { return e - now; }));
       html += "</td><td>";
-      visit(overloaded{
-                [&](const dns::Entry::Ready &ready) { html += ready.to_html(); },
-                [&](const dns::Entry::Pending &pending) { html += "Pending"; }},
-            entry.state);
+      visit(
+          overloaded{
+              [&](const dns::Entry::Ready &ready) { html += ready.to_html(); },
+              [&](const dns::Entry::Pending &pending) { html += "Pending"; }},
+          entry.state);
       html += "</td></tr>";
     };
 
@@ -2308,6 +2364,7 @@ void Start(string &err) {
 
 // TODO: DHCP NAK when requested IP mismatches desired IP
 // TODO: rename to Gatekeeper
+// TODO: log with 100 last events for each category of events
 int main(int argc, char *argv[]) {
   string err;
 
