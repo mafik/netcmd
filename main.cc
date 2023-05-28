@@ -69,12 +69,12 @@ std::string IndentString(std::string in, int spaces = 2) {
   return out;
 }
 
-
-string FormatDuration(optional<steady_clock::duration> d_opt, const char* never = "∞") {
+string FormatDuration(optional<steady_clock::duration> d_opt,
+                      const char *never = "∞") {
   if (!d_opt) {
     return never;
   }
-  steady_clock::duration& d = *d_opt;
+  steady_clock::duration &d = *d_opt;
   string r;
   auto h = duration_cast<chrono::hours>(d);
   d -= h;
@@ -134,7 +134,6 @@ template <class... Ts> struct overloaded : Ts... {
 template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 template <typename Iter> Iter next(Iter iter) { return ++iter; }
-
 
 namespace rfc1700 {
 
@@ -1094,7 +1093,8 @@ struct Server : epoll::Listener {
       if (auto it = entries.find(requested_ip); it != entries.end()) {
         Entry &entry = it->second;
         if ((entry.client_id != client_id) &&
-            (entry.expiration ? entry.expiration > steady_clock::now() : true)) {
+            (entry.expiration ? entry.expiration > steady_clock::now()
+                              : true)) {
           // Requested IP is taken by another client.
           ok = false;
         }
@@ -1175,6 +1175,12 @@ struct Server : epoll::Listener {
     steady_clock::duration lease_time = 0s;
     bool inform = false;
 
+    const IP chosen_ip = inform ? IP(0, 0, 0, 0) : ChooseIP(packet, log_error);
+    if (!log_error.empty()) {
+      ERROR << log_error << "\n" << packet.to_string();
+      return;
+    }
+
     int request_lease_time_seconds = 60;
     switch (packet.MessageType()) {
     case options::MessageType::DISCOVER:
@@ -1182,7 +1188,12 @@ struct Server : epoll::Listener {
       lease_time = 10s;
       break;
     case options::MessageType::REQUEST:
-      response_type = options::MessageType::ACK;
+      if (auto *opt = packet.FindOption<options::RequestedIPAddress>();
+          opt != nullptr && opt->ip != chosen_ip) {
+        response_type = options::MessageType::NAK;
+      } else {
+        response_type = options::MessageType::ACK;
+      }
       lease_time = request_lease_time_seconds * 1s;
       break;
     case options::MessageType::INFORM:
@@ -1193,12 +1204,6 @@ struct Server : epoll::Listener {
     default:
       response_type = options::MessageType::UNKNOWN;
       break;
-    }
-
-    const IP chosen_ip = inform ? IP(0, 0, 0, 0) : ChooseIP(packet, log_error);
-    if (!log_error.empty()) {
-      ERROR << log_error << "\n" << packet.to_string();
-      return;
     }
 
     if (inform && source_ip != packet.client_ip) {
@@ -1323,7 +1328,7 @@ string TypeToString(Type t) {
   case Type::ANY:
     return "ANY";
   default:
-    return f("UNKNOWN(%hu)", (uint16_t)t);
+    return f("UNKNOWN(%hu)", ntohs((uint16_t)t));
   }
 }
 
@@ -1436,8 +1441,7 @@ struct Question {
     buffer.append((char *)&class_, sizeof(class_));
   }
   string to_string() const {
-    return "dns::Question(" + domain_name +
-           ", type=" + TypeToString(type) +
+    return "dns::Question(" + domain_name + ", type=" + TypeToString(type) +
            ", class=" + string(ClassToString(class_)) + ")";
   }
   bool operator==(const Question &other) const {
@@ -2301,29 +2305,35 @@ void Handler(Response &response, Request &request) {
       html += "</td></tr>";
     }
   });
-  table("DHCP", {"IP", "Client ID", "Hostname", "TTL", "Last activity", "Stable"}, [&]() {
-    for (auto &[ip, entry] : dhcp::server.entries) {
-      html += "<tr><td>";
-      html += ip.to_string();
-      html += "</td><td>";
-      html += entry.client_id;
-      html += "</td><td>";
-      html += entry.hostname;
-      html += "</td><td>";
-      html += FormatDuration(entry.expiration.transform([&](auto e) { return e - now; }));
-      html += "</td><td>";
-      html += FormatDuration(entry.last_request.transform([&](auto x) { return x - now; }), "never");
-      html += "</td><td>";
-      html += entry.stable ? "✓" : "";
-      html += "</td></tr>";
-    }
-  });
+  table("DHCP",
+        {"IP", "Client ID", "Hostname", "TTL", "Last activity", "Stable"},
+        [&]() {
+          for (auto &[ip, entry] : dhcp::server.entries) {
+            html += "<tr><td>";
+            html += ip.to_string();
+            html += "</td><td>";
+            html += entry.client_id;
+            html += "</td><td>";
+            html += entry.hostname;
+            html += "</td><td>";
+            html += FormatDuration(
+                entry.expiration.transform([&](auto e) { return e - now; }));
+            html += "</td><td>";
+            html += FormatDuration(
+                entry.last_request.transform([&](auto x) { return x - now; }),
+                "never");
+            html += "</td><td>";
+            html += entry.stable ? "✓" : "";
+            html += "</td></tr>";
+          }
+        });
   table("DNS cache", {"Question", "TTL", "State"}, [&]() {
     auto emit_dns_entry = [&](const dns::Entry &entry) {
       html += "<tr><td>";
       html += entry.question.to_html();
       html += "</td><td>";
-      html += FormatDuration(entry.expiration.transform([&](auto e) { return e - now; }));
+      html += FormatDuration(
+          entry.expiration.transform([&](auto e) { return e - now; }));
       html += "</td><td>";
       visit(
           overloaded{
@@ -2362,7 +2372,6 @@ void Start(string &err) {
 
 } // namespace http
 
-// TODO: DHCP NAK when requested IP mismatches desired IP
 // TODO: rename to Gatekeeper
 // TODO: log with 100 last events for each category of events
 int main(int argc, char *argv[]) {
